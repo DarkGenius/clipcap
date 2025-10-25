@@ -225,6 +225,24 @@ async function handleMessage(msg) {
         return { ok: false, error: 'No active download found' };
       }
     }
+    if (msg.type === 'host:open-file') {
+      const { filepath } = msg;
+      await log(`Opening file: ${filepath}`);
+
+      try {
+        // На Windows используем команду start для открытия файла
+        // Используем команду через cmd.exe для корректной работы start
+        await execFileAsync('cmd.exe', ['/c', 'start', '', filepath], { timeout: 5000 });
+        await log(`File opened successfully: ${filepath}`);
+        return { ok: true, kind: 'open-file', message: 'File opened' };
+      } catch (err) {
+        await log(`Error opening file: ${err.message || String(err)}`);
+        return {
+          ok: false,
+          error: 'Ошибка открытия файла: ' + (err.message || String(err))
+        };
+      }
+    }
     await log(`Unknown message type: ${msg.type}`);
     return { ok: false, error: 'Unknown message type' };
   } catch (err) {

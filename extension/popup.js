@@ -8,9 +8,10 @@ const ytdlpPathInput = document.getElementById('ytdlp-path');
 const ytdlpOutputInput = document.getElementById('ytdlp-output');
 const btnSaveSettings = document.getElementById('btn-save-settings');
 const btnClearLog = document.getElementById('btn-clear-log');
-const btnToggleSettings = document.getElementById('btn-toggle-settings');
+const btnOpenSettings = document.getElementById('btn-open-settings');
+const btnCloseSettings = document.getElementById('btn-close-settings');
+const settingsModal = document.getElementById('settings-modal');
 const btnToggleLogs = document.getElementById('btn-toggle-logs');
-const settingsContent = document.getElementById('settings-content');
 const logsContent = document.getElementById('logs-content');
 const downloadsListEl = document.getElementById('downloads-list');
 const activeDownloadsCountEl = document.getElementById('active-downloads-count');
@@ -27,6 +28,8 @@ const pendingChecks = new Map();
 
 // Ключ для хранения активных загрузок
 const ACTIVE_DOWNLOADS_KEY = 'activeDownloads';
+// Ключ для хранения завершенных загрузок
+const COMPLETED_DOWNLOADS_KEY = 'completedDownloads';
 
 function log(msg) {
   logEl.textContent += (typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2)) + '\n';
@@ -187,12 +190,25 @@ chrome.runtime.onMessage.addListener(async (msg) => {
         }
       }
 
+      // Получаем данные активной загрузки перед удалением
+      const activeDownloads = await getActiveDownloads();
+      const downloadData = activeDownloads[url];
+
       // Удаляем из активных загрузок
       await removeActiveDownload(url);
 
-      // Обновляем счетчик и список загрузок
-      const activeDownloads = await getActiveDownloads();
-      activeDownloadsCountEl.textContent = Object.keys(activeDownloads).length;
+      // Если загрузка успешна, сохраняем в завершенные
+      if (success && downloadData) {
+        await saveCompletedDownload(url, {
+          ...downloadData,
+          filepath: filepath,
+          success: true
+        });
+      }
+
+      // Обновляем счетчик активных загрузок
+      const updatedActiveDownloads = await getActiveDownloads();
+      activeDownloadsCountEl.textContent = Object.keys(updatedActiveDownloads).length;
 
       // Если вкладка "Загрузки" открыта, обновляем список
       const downloadsTab = document.querySelector('.tab-btn[data-tab="downloads"]');
@@ -254,6 +270,11 @@ function restoreDownloadUI(url, downloadData) {
   }
 
   downloadBtn.disabled = true;
+
+  // Скрываем кнопки "Проверить" и "Скачать"
+  const checkBtn = downloadBtn.parentElement.querySelector('.check-btn');
+  if (checkBtn) checkBtn.style.display = 'none';
+  if (downloadBtn) downloadBtn.style.display = 'none';
 
   // Показываем прогресс-бар с кнопкой отмены
   progressContainer.innerHTML = `
@@ -506,6 +527,31 @@ async function getActiveDownloads() {
   return result[ACTIVE_DOWNLOADS_KEY] || {};
 }
 
+// Сохранить завершенную загрузку
+async function saveCompletedDownload(url, data) {
+  const result = await chrome.storage.local.get([COMPLETED_DOWNLOADS_KEY]);
+  const completedDownloads = result[COMPLETED_DOWNLOADS_KEY] || {};
+  completedDownloads[url] = {
+    ...data,
+    completedAt: new Date().toISOString()
+  };
+  await chrome.storage.local.set({ [COMPLETED_DOWNLOADS_KEY]: completedDownloads });
+}
+
+// Удалить завершенную загрузку
+async function removeCompletedDownload(url) {
+  const result = await chrome.storage.local.get([COMPLETED_DOWNLOADS_KEY]);
+  const completedDownloads = result[COMPLETED_DOWNLOADS_KEY] || {};
+  delete completedDownloads[url];
+  await chrome.storage.local.set({ [COMPLETED_DOWNLOADS_KEY]: completedDownloads });
+}
+
+// Получить все завершенные загрузки
+async function getCompletedDownloads() {
+  const result = await chrome.storage.local.get([COMPLETED_DOWNLOADS_KEY]);
+  return result[COMPLETED_DOWNLOADS_KEY] || {};
+}
+
 async function cancelDownload(url, cancelBtn) {
   try {
     cancelBtn.disabled = true;
@@ -539,6 +585,12 @@ async function downloadM3u8(url, formatId, resolution, btnElement) {
 
   try {
     btnElement.disabled = true;
+
+    // Скрываем кнопки "Проверить" и "Скачать"
+    const checkBtn = btnElement.parentElement.querySelector('.check-btn');
+    const downloadBtn = btnElement.parentElement.querySelector('.download-btn');
+    if (checkBtn) checkBtn.style.display = 'none';
+    if (downloadBtn) downloadBtn.style.display = 'none';
 
     // Получаем настройки
     const settings = await loadSettings();
@@ -631,47 +683,94 @@ function escapeHtml(text) {
 // Функция для отображения активных загрузок
 async function loadDownloads() {
   const activeDownloads = await getActiveDownloads();
-  const downloadCount = Object.keys(activeDownloads).length;
+  const completedDownloads = await getCompletedDownloads();
+  const activeCount = Object.keys(activeDownloads).length;
+  const completedCount = Object.keys(completedDownloads).length;
 
-  // Обновляем счетчик в заголовке вкладки
-  activeDownloadsCountEl.textContent = downloadCount;
+  // Обновляем счетчик в заголовке вкладки (только активные)
+  activeDownloadsCountEl.textContent = activeCount;
 
-  if (downloadCount === 0) {
-    downloadsListEl.innerHTML = '<div class="empty-state">Нет активных загрузок</div>';
+  if (activeCount === 0 && completedCount === 0) {
+    downloadsListEl.innerHTML = '<div class="empty-state">Нет загрузок</div>';
     return;
   }
 
-  // Формируем HTML для каждой загрузки
-  const downloadsHtml = Object.entries(activeDownloads).map(([url, data], index) => {
-    const shortUrl = url.length > 100 ? url.substring(0, 100) + '...' : url;
-    const percent = data.percent || 0;
+  let downloadsHtml = '';
 
-    return `
-      <div class="download-item" data-url="${escapeHtml(url)}" data-index="${index}">
-        <div class="url" title="${escapeHtml(url)}">${escapeHtml(shortUrl)}</div>
-        <div class="filename">📁 ${escapeHtml(data.filename || 'video.mp4')} • ${data.resolution || 'неизвестно'}</div>
-        <div class="progress">
-          <div class="progress-bar">
-            <div class="progress-fill" style="width: ${percent}%"></div>
-            <div class="progress-text">${percent.toFixed(1)}%</div>
+  // Формируем HTML для активных загрузок
+  if (activeCount > 0) {
+    downloadsHtml += '<div class="downloads-section"><h3>Активные загрузки</h3>';
+    downloadsHtml += Object.entries(activeDownloads).map(([url, data], index) => {
+      const shortUrl = url.length > 80 ? url.substring(0, 80) + '...' : url;
+      const percent = data.percent || 0;
+
+      return `
+        <div class="download-item active" data-url="${escapeHtml(url)}" data-index="${index}">
+          <div class="url" title="${escapeHtml(url)}">${escapeHtml(shortUrl)}</div>
+          <div class="filename">📁 ${escapeHtml(data.filename || 'video.mp4')} • ${data.resolution || 'неизвестно'}</div>
+          <div class="progress">
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: ${percent}%"></div>
+              <div class="progress-text">${percent.toFixed(1)}%</div>
+            </div>
+            <button class="cancel-btn" data-url="${escapeHtml(url)}">Отменить</button>
           </div>
-          <button class="cancel-btn" data-index="${index}">Отменить</button>
         </div>
-      </div>
-    `;
-  }).join('');
+      `;
+    }).join('');
+    downloadsHtml += '</div>';
+  }
+
+  // Формируем HTML для завершенных загрузок
+  if (completedCount > 0) {
+    downloadsHtml += '<div class="downloads-section"><h3>Завершенные загрузки</h3>';
+    downloadsHtml += Object.entries(completedDownloads).map(([url, data], index) => {
+      const shortUrl = url.length > 100 ? url.substring(0, 100) + '...' : url;
+      const shortFilepath = data.filepath ? (data.filepath.length > 80 ? '...' + data.filepath.substring(data.filepath.length - 80) : data.filepath) : '';
+
+      return `
+        <div class="download-item completed" data-url="${escapeHtml(url)}" data-index="${index}">
+          <button class="remove-btn" data-url="${escapeHtml(url)}" title="Удалить из списка">×</button>
+          <div class="url" title="${escapeHtml(url)}">${escapeHtml(shortUrl)}</div>
+          <div class="filename">✓ ${escapeHtml(data.filename || 'video.mp4')} • ${data.resolution || 'неизвестно'}</div>
+          <div class="filepath" title="${escapeHtml(data.filepath || '')}">${escapeHtml(shortFilepath)}</div>
+          <div class="completed-actions">
+            <button class="open-btn" data-filepath="${escapeHtml(data.filepath || '')}">Открыть</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+    downloadsHtml += '</div>';
+  }
 
   downloadsListEl.innerHTML = downloadsHtml;
 
-  // Добавляем обработчики для кнопок отмены
+  // Добавляем обработчики для кнопок отмены (активные загрузки)
   const cancelButtons = downloadsListEl.querySelectorAll('.cancel-btn');
-  Object.entries(activeDownloads).forEach(([url, data], index) => {
-    const btn = cancelButtons[index];
-    if (btn) {
-      btn.addEventListener('click', async () => {
-        await cancelDownloadFromList(url, btn);
-      });
-    }
+  cancelButtons.forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const url = btn.getAttribute('data-url');
+      await cancelDownloadFromList(url, btn);
+    });
+  });
+
+  // Добавляем обработчики для кнопок удаления (завершенные загрузки)
+  const removeButtons = downloadsListEl.querySelectorAll('.remove-btn');
+  removeButtons.forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const url = btn.getAttribute('data-url');
+      await removeCompletedDownload(url);
+      await loadDownloads(); // Обновляем список
+    });
+  });
+
+  // Добавляем обработчики для кнопок открытия (завершенные загрузки)
+  const openButtons = downloadsListEl.querySelectorAll('.open-btn');
+  openButtons.forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const filepath = btn.getAttribute('data-filepath');
+      await openFile(filepath, btn);
+    });
   });
 }
 
@@ -705,6 +804,43 @@ async function cancelDownloadFromList(url, cancelBtn) {
   }
 }
 
+// Открыть файл в системе
+async function openFile(filepath, openBtn) {
+  try {
+    if (!filepath) {
+      throw new Error('Путь к файлу не указан');
+    }
+
+    openBtn.disabled = true;
+    const originalText = openBtn.textContent;
+    openBtn.textContent = 'Открытие...';
+
+    await ensureConnect();
+
+    const sendResult = await chrome.runtime.sendMessage({
+      type: 'host:open-file',
+      filepath: filepath
+    });
+
+    if (!sendResult || !sendResult.ok) {
+      throw new Error('Не удалось открыть файл: ' + (sendResult?.error || 'неизвестная ошибка'));
+    }
+
+    // Визуальная обратная связь
+    openBtn.textContent = '✓ Открыто';
+    setTimeout(() => {
+      openBtn.textContent = originalText;
+      openBtn.disabled = false;
+    }, 1500);
+
+  } catch (err) {
+    log(`Ошибка открытия файла: ${err.message}`);
+    openBtn.disabled = false;
+    openBtn.textContent = 'Открыть';
+    alert(`Ошибка открытия файла: ${err.message}`);
+  }
+}
+
 // Переключение вкладок
 function initTabs() {
   const tabButtons = document.querySelectorAll('.tab-btn');
@@ -732,14 +868,14 @@ function initTabs() {
   });
 }
 
-// Переключение видимости настроек
-function toggleSettings() {
-  settingsContent.classList.toggle('visible');
-  if (settingsContent.classList.contains('visible')) {
-    btnToggleSettings.textContent = '⚙️ Скрыть настройки';
-  } else {
-    btnToggleSettings.textContent = '⚙️ Настройки';
-  }
+// Открытие модального окна настроек
+function openSettings() {
+  settingsModal.classList.add('visible');
+}
+
+// Закрытие модального окна настроек
+function closeSettings() {
+  settingsModal.classList.remove('visible');
 }
 
 // Переключение видимости логов
@@ -755,21 +891,27 @@ function toggleLogs() {
 btnRefreshM3u8.addEventListener('click', loadM3u8Urls);
 btnClearM3u8.addEventListener('click', clearM3u8Urls);
 btnRefreshDownloads.addEventListener('click', loadDownloads);
-btnSaveSettings.addEventListener('click', () => {
-  saveSettings();
-  // Скрываем настройки после сохранения
+btnOpenSettings.addEventListener('click', openSettings);
+btnCloseSettings.addEventListener('click', closeSettings);
+btnSaveSettings.addEventListener('click', async () => {
+  await saveSettings();
+  // Закрываем модальное окно после сохранения
   setTimeout(() => {
-    if (settingsContent.classList.contains('visible')) {
-      toggleSettings();
-    }
-  }, 500);
+    closeSettings();
+  }, 1500);
 });
 btnClearLog.addEventListener('click', () => {
   logEl.textContent = '';
   log('Логи очищены');
 });
-btnToggleSettings.addEventListener('click', toggleSettings);
 btnToggleLogs.addEventListener('click', toggleLogs);
+
+// Закрытие модального окна при клике на overlay
+settingsModal.addEventListener('click', (e) => {
+  if (e.target === settingsModal) {
+    closeSettings();
+  }
+});
 
 // Инициализация вкладок
 initTabs();

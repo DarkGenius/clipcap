@@ -3,6 +3,8 @@ let port = null;
 
 // Ключ для хранения активных загрузок
 const ACTIVE_DOWNLOADS_KEY = "activeDownloads";
+// Ключ для хранения завершенных загрузок
+const COMPLETED_DOWNLOADS_KEY = "completedDownloads";
 
 function connect() {
   if (port) return;
@@ -58,17 +60,42 @@ function connect() {
         msg.success
       );
 
-      // Удаляем из активных загрузок
-      const result = await chrome.storage.local.get([ACTIVE_DOWNLOADS_KEY]);
+      // Получаем активные загрузки
+      const result = await chrome.storage.local.get([
+        ACTIVE_DOWNLOADS_KEY,
+        COMPLETED_DOWNLOADS_KEY,
+      ]);
       const activeDownloads = result[ACTIVE_DOWNLOADS_KEY] || {};
+      const completedDownloads = result[COMPLETED_DOWNLOADS_KEY] || {};
 
+      // Если загрузка была активной
       if (activeDownloads[msg.url]) {
+        const downloadData = activeDownloads[msg.url];
+
+        // Если загрузка успешна, сохраняем в завершенные
+        if (msg.success) {
+          completedDownloads[msg.url] = {
+            ...downloadData,
+            filepath: msg.filepath,
+            success: true,
+            completedAt: new Date().toISOString(),
+          };
+          console.log(
+            "[Background] Saved completed download to storage:",
+            msg.url
+          );
+        }
+
+        // Удаляем из активных загрузок
         delete activeDownloads[msg.url];
+
+        // Сохраняем обновленные данные
         await chrome.storage.local.set({
           [ACTIVE_DOWNLOADS_KEY]: activeDownloads,
+          [COMPLETED_DOWNLOADS_KEY]: completedDownloads,
         });
         console.log(
-          "[Background] Removed completed download from storage:",
+          "[Background] Removed from active downloads:",
           msg.url
         );
       }
@@ -113,7 +140,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message?.type === "host:list" ||
     message?.type === "host:ytdlp-check" ||
     message?.type === "host:ytdlp-download" ||
-    message?.type === "host:ytdlp-cancel"
+    message?.type === "host:ytdlp-cancel" ||
+    message?.type === "host:open-file"
   ) {
     console.log(
       "[Background] Forwarding message to native host:",

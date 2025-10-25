@@ -58,18 +58,33 @@
         font-size: 10px;
       }
       .m3u8-item .check-btn {
-        padding: 4px 8px;
+        padding: 3px 8px;
         font-size: 10px;
         margin-top: 4px;
         margin-right: 4px;
+        background: #f0f0f0;
+        color: #333;
+        border: 1px solid #ddd;
+        border-radius: 3px;
+        cursor: pointer;
+      }
+      .m3u8-item .check-btn:hover {
+        background: #e0e0e0;
+      }
+      .m3u8-item .check-btn:disabled {
+        background: #f5f5f5;
+        color: #999;
+        cursor: not-allowed;
       }
       .m3u8-item .download-btn {
-        padding: 4px 8px;
+        padding: 3px 10px;
         font-size: 10px;
         margin-top: 4px;
         background: #4caf50;
         color: white;
         border: none;
+        border-radius: 3px;
+        cursor: pointer;
       }
       .m3u8-item .download-btn:hover {
         background: #45a049;
@@ -153,16 +168,88 @@
       .settings-content.visible {
         display: block;
       }
-      .toggle-btn {
+      .compact-btn {
         background: #f0f0f0;
         color: #333;
-        font-size: 11px;
-        padding: 6px 10px;
+        font-size: 10px;
+        padding: 4px 8px;
         cursor: pointer;
         border: 1px solid #ddd;
+        border-radius: 3px;
       }
-      .toggle-btn:hover {
+      .compact-btn:hover {
         background: #e0e0e0;
+      }
+      .gear-btn {
+        background: none;
+        border: none;
+        font-size: 20px;
+        cursor: pointer;
+        padding: 4px 8px;
+        color: #666;
+      }
+      .gear-btn:hover {
+        color: #333;
+        background: #f0f0f0;
+        border-radius: 4px;
+      }
+      .modal-overlay {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 1000;
+        align-items: center;
+        justify-content: center;
+      }
+      .modal-overlay.visible {
+        display: flex;
+      }
+      .modal-content {
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        width: 440px;
+        max-height: 80vh;
+        overflow-y: auto;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        position: relative;
+      }
+      .modal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 16px;
+      }
+      .modal-header h3 {
+        margin: 0;
+      }
+      .modal-close {
+        background: none;
+        border: none;
+        font-size: 24px;
+        cursor: pointer;
+        color: #666;
+        padding: 0;
+        width: 30px;
+        height: 30px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .modal-close:hover {
+        color: #333;
+        background: #f0f0f0;
+        border-radius: 50%;
+      }
+      .header-with-gear {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 12px;
       }
       .tabs {
         display: flex;
@@ -201,6 +288,7 @@
         background: #f9f9f9;
         border-radius: 4px;
         border: 1px solid #e0e0e0;
+        position: relative;
       }
       .download-item .url {
         color: #0066cc;
@@ -213,10 +301,134 @@
         font-size: 10px;
         margin-bottom: 4px;
       }
+      .downloads-section {
+        margin-bottom: 16px;
+      }
+      .downloads-section h3 {
+        font-size: 13px;
+        margin: 8px 0;
+        color: #555;
+      }
+      .download-item.completed {
+        background: #f0f8f0;
+        border-color: #c8e6c9;
+        padding-right: 32px;
+      }
+      .download-item.completed .filename {
+        color: #2e7d32;
+      }
+      .download-item .filepath {
+        color: #999;
+        font-size: 9px;
+        margin-bottom: 6px;
+        word-break: break-all;
+      }
+      .download-item .remove-btn {
+        position: absolute;
+        top: 6px;
+        right: 6px;
+        width: 18px;
+        height: 18px;
+        padding: 0;
+        background: #999;
+        color: white;
+        border: none;
+        border-radius: 50%;
+        cursor: pointer;
+        font-size: 14px;
+        line-height: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        opacity: 0.6;
+        transition: opacity 0.2s, background 0.2s;
+      }
+      .download-item .remove-btn:hover {
+        background: #666;
+        opacity: 1;
+      }
+      .download-item .completed-actions {
+        margin-top: 6px;
+        display: flex;
+        gap: 4px;
+      }
+      .download-item .open-btn {
+        padding: 4px 12px;
+        font-size: 10px;
+        background: #2196f3;
+        color: white;
+        border: none;
+        border-radius: 3px;
+        cursor: pointer;
+      }
+      .download-item .open-btn:hover {
+        background: #1976d2;
+      }
+      .download-item .open-btn:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+      }
+      .download-item .progress {
+        margin-top: 6px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .download-item .progress-bar {
+        flex: 1;
+        height: 20px;
+        background: #f0f0f0;
+        border-radius: 4px;
+        position: relative;
+        overflow: hidden;
+      }
+      .download-item .progress-fill {
+        position: absolute;
+        left: 0;
+        top: 0;
+        height: 100%;
+        background: #4caf50;
+        transition: width 0.3s;
+      }
+      .download-item .progress-text {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #333;
+        font-size: 11px;
+        font-weight: 600;
+      }
+      .download-item .cancel-btn {
+        padding: 4px 10px;
+        font-size: 10px;
+        background: #f44336;
+        color: white;
+        border: none;
+        border-radius: 3px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .download-item .cancel-btn:hover {
+        background: #d32f2f;
+      }
+      .download-item .cancel-btn:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+      }
     </style>
   </head>
   <body>
-    <h3>ClipCap</h3>
+    <div class="header-with-gear">
+      <h3 style="margin: 0">ClipCap</h3>
+      <button id="btn-open-settings" class="gear-btn" title="Настройки">
+        ⚙️
+      </button>
+    </div>
 
     <div class="tabs">
       <button class="tab-btn active" data-tab="current-page">
@@ -224,23 +436,6 @@
       </button>
       <button class="tab-btn" data-tab="downloads">
         Загрузки (<span id="active-downloads-count">0</span>)
-      </button>
-    </div>
-
-    <div style="margin-bottom: 12px">
-      <button id="btn-toggle-settings" class="toggle-btn">⚙️ Настройки</button>
-    </div>
-
-    <div id="settings-content" class="settings-content">
-      <h4 style="margin: 0 0 8px 0">Настройки yt-dlp</h4>
-      <label>Путь к yt-dlp:</label>
-      <input id="ytdlp-path" placeholder="E:\yt-dlp\yt-dlp.exe" />
-      <label style="margin-top: 8px; display: block"
-        >Путь для сохранения видео:</label
-      >
-      <input id="ytdlp-output" placeholder="E:\yt-dlp" />
-      <button id="btn-save-settings" style="margin-top: 8px">
-        Сохранить настройки
       </button>
     </div>
 
@@ -255,9 +450,13 @@
             >загрузка...</span
           >
         </div>
-        <div style="display: flex; gap: 8px; margin-bottom: 8px">
-          <button id="btn-refresh-m3u8">Обновить список</button>
-          <button id="btn-clear-m3u8">Очистить для этой страницы</button>
+        <div style="display: flex; gap: 6px; margin-bottom: 8px">
+          <button id="btn-refresh-m3u8" class="compact-btn">
+            Обновить список
+          </button>
+          <button id="btn-clear-m3u8" class="compact-btn">
+            Очистить для этой страницы
+          </button>
         </div>
         <div class="muted">
           Найденные .m3u8 URL (<span id="m3u8-count">0</span>):
@@ -272,19 +471,23 @@
 
     <div id="tab-downloads" class="tab-content">
       <div class="section">
-        <h3>Активные загрузки</h3>
-        <div style="display: flex; gap: 8px; margin-bottom: 8px">
-          <button id="btn-refresh-downloads">Обновить</button>
+        <h3>Загрузки</h3>
+        <div style="display: flex; gap: 6px; margin-bottom: 8px">
+          <button id="btn-refresh-downloads" class="compact-btn">
+            Обновить
+          </button>
         </div>
         <div id="downloads-list">
-          <div class="empty-state">Нет активных загрузок</div>
+          <div class="empty-state">Нет загрузок</div>
         </div>
       </div>
     </div>
 
     <div class="section">
       <div style="margin-bottom: 8px">
-        <button id="btn-toggle-logs" class="toggle-btn">📋 Логи отладки</button>
+        <button id="btn-toggle-logs" class="compact-btn">
+          📋 Логи отладки
+        </button>
       </div>
       <div id="logs-content" class="settings-content">
         <div
@@ -301,6 +504,27 @@
           </button>
         </div>
         <pre id="log"></pre>
+      </div>
+    </div>
+
+    <!-- Модальное окно настроек -->
+    <div id="settings-modal" class="modal-overlay">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>Настройки</h3>
+          <button id="btn-close-settings" class="modal-close">×</button>
+        </div>
+        <div>
+          <label>Путь к yt-dlp:</label>
+          <input id="ytdlp-path" placeholder="E:\yt-dlp\yt-dlp.exe" />
+          <label style="margin-top: 8px; display: block"
+            >Путь для сохранения видео:</label
+          >
+          <input id="ytdlp-output" placeholder="E:\yt-dlp" />
+          <button id="btn-save-settings" style="margin-top: 12px">
+            Сохранить настройки
+          </button>
+        </div>
       </div>
     </div>
 
