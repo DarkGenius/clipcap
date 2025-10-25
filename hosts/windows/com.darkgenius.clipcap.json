@@ -1,0 +1,7 @@
+{
+  "name": "com.darkgenius.clipcap",
+  "description": "Stream video downloader",
+  "path": "E:\\Projects\\clipcap\\native-host\\index.cmd",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://nfflmdjnaogccimkemahijjkejibcgne/"]
+}

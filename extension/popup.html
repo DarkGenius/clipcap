@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>ClipCap</title>
+    <style>
+      body {
+        font-family: system-ui;
+        margin: 16px;
+        width: 480px;
+      }
+      button {
+        padding: 8px 12px;
+        margin: 4px 0;
+      }
+      input {
+        width: 100%;
+        padding: 6px;
+        margin: 4px 0;
+      }
+      pre {
+        background: #f6f6f6;
+        padding: 8px;
+        border-radius: 6px;
+        max-height: 240px;
+        overflow: auto;
+      }
+      .muted {
+        color: #666;
+        font-size: 12px;
+      }
+      .section {
+        border-top: 1px solid #ddd;
+        padding-top: 12px;
+        margin-top: 12px;
+      }
+      .m3u8-list {
+        max-height: 200px;
+        overflow-y: auto;
+        background: #f6f6f6;
+        padding: 8px;
+        border-radius: 6px;
+      }
+      .m3u8-item {
+        font-size: 11px;
+        margin: 6px 0;
+        padding: 6px;
+        background: white;
+        border-radius: 4px;
+        word-break: break-all;
+      }
+      .m3u8-item .url {
+        color: #0066cc;
+        margin-bottom: 4px;
+      }
+      .m3u8-item .time {
+        color: #999;
+        font-size: 10px;
+      }
+      .m3u8-item .check-btn {
+        padding: 4px 8px;
+        font-size: 10px;
+        margin-top: 4px;
+        margin-right: 4px;
+      }
+      .m3u8-item .download-btn {
+        padding: 4px 8px;
+        font-size: 10px;
+        margin-top: 4px;
+        background: #4caf50;
+        color: white;
+        border: none;
+      }
+      .m3u8-item .download-btn:hover {
+        background: #45a049;
+      }
+      .m3u8-item .download-btn:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+      }
+      .m3u8-item .info {
+        margin-top: 4px;
+        padding: 4px;
+        background: #f0f0f0;
+        border-radius: 3px;
+        font-size: 10px;
+      }
+      .m3u8-item .info.success {
+        background: #e8f5e9;
+        color: #2e7d32;
+      }
+      .m3u8-item .info.error {
+        background: #ffebee;
+        color: #c62828;
+      }
+      .m3u8-item .progress {
+        margin-top: 4px;
+      }
+      .m3u8-item .progress-bar {
+        width: 100%;
+        height: 20px;
+        background: #f0f0f0;
+        border-radius: 4px;
+        position: relative;
+        overflow: hidden;
+      }
+      .m3u8-item .progress-fill {
+        position: absolute;
+        left: 0;
+        top: 0;
+        height: 100%;
+        background: #4caf50;
+        transition: width 0.3s;
+      }
+      .m3u8-item .progress-text {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #333;
+        font-size: 11px;
+        font-weight: 600;
+      }
+      .m3u8-item .cancel-btn {
+        padding: 4px 8px;
+        font-size: 10px;
+        margin-top: 4px;
+        background: #f44336;
+        color: white;
+        border: none;
+        cursor: pointer;
+      }
+      .m3u8-item .cancel-btn:hover {
+        background: #d32f2f;
+      }
+      .m3u8-item .cancel-btn:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+      }
+      .empty-state {
+        text-align: center;
+        color: #999;
+        padding: 20px;
+      }
+      .settings-content {
+        display: none;
+        margin-top: 12px;
+      }
+      .settings-content.visible {
+        display: block;
+      }
+      .toggle-btn {
+        background: #f0f0f0;
+        color: #333;
+        font-size: 11px;
+        padding: 6px 10px;
+        cursor: pointer;
+        border: 1px solid #ddd;
+      }
+      .toggle-btn:hover {
+        background: #e0e0e0;
+      }
+      .tabs {
+        display: flex;
+        gap: 4px;
+        margin-bottom: 12px;
+        border-bottom: 2px solid #ddd;
+      }
+      .tab-btn {
+        flex: 1;
+        padding: 8px 12px;
+        background: none;
+        border: none;
+        cursor: pointer;
+        font-size: 12px;
+        color: #666;
+        border-bottom: 2px solid transparent;
+        margin-bottom: -2px;
+      }
+      .tab-btn:hover {
+        background: #f0f0f0;
+      }
+      .tab-btn.active {
+        color: #333;
+        font-weight: 600;
+        border-bottom-color: #4caf50;
+      }
+      .tab-content {
+        display: none;
+      }
+      .tab-content.active {
+        display: block;
+      }
+      .download-item {
+        margin: 8px 0;
+        padding: 8px;
+        background: #f9f9f9;
+        border-radius: 4px;
+        border: 1px solid #e0e0e0;
+      }
+      .download-item .url {
+        color: #0066cc;
+        font-size: 11px;
+        margin-bottom: 4px;
+        word-break: break-all;
+      }
+      .download-item .filename {
+        color: #666;
+        font-size: 10px;
+        margin-bottom: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>ClipCap</h3>
+
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="current-page">
+        Текущая страница
+      </button>
+      <button class="tab-btn" data-tab="downloads">
+        Загрузки (<span id="active-downloads-count">0</span>)
+      </button>
+    </div>
+
+    <div style="margin-bottom: 12px">
+      <button id="btn-toggle-settings" class="toggle-btn">⚙️ Настройки</button>
+    </div>
+
+    <div id="settings-content" class="settings-content">
+      <h4 style="margin: 0 0 8px 0">Настройки yt-dlp</h4>
+      <label>Путь к yt-dlp:</label>
+      <input id="ytdlp-path" placeholder="E:\yt-dlp\yt-dlp.exe" />
+      <label style="margin-top: 8px; display: block"
+        >Путь для сохранения видео:</label
+      >
+      <input id="ytdlp-output" placeholder="E:\yt-dlp" />
+      <button id="btn-save-settings" style="margin-top: 8px">
+        Сохранить настройки
+      </button>
+    </div>
+
+    <div id="tab-current-page" class="tab-content active">
+      <div class="section">
+        <h3>Отслеживание .m3u8 запросов</h3>
+        <div class="muted" style="margin-bottom: 8px">
+          Текущая страница:
+          <span
+            id="current-page"
+            style="color: #0066cc; font-size: 10px; word-break: break-all"
+            >загрузка...</span
+          >
+        </div>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px">
+          <button id="btn-refresh-m3u8">Обновить список</button>
+          <button id="btn-clear-m3u8">Очистить для этой страницы</button>
+        </div>
+        <div class="muted">
+          Найденные .m3u8 URL (<span id="m3u8-count">0</span>):
+        </div>
+        <div id="m3u8-list" class="m3u8-list">
+          <div class="empty-state">
+            На этой странице не найдено .m3u8 запросов
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-downloads" class="tab-content">
+      <div class="section">
+        <h3>Активные загрузки</h3>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px">
+          <button id="btn-refresh-downloads">Обновить</button>
+        </div>
+        <div id="downloads-list">
+          <div class="empty-state">Нет активных загрузок</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div style="margin-bottom: 8px">
+        <button id="btn-toggle-logs" class="toggle-btn">📋 Логи отладки</button>
+      </div>
+      <div id="logs-content" class="settings-content">
+        <div
+          style="
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+          "
+        >
+          <div class="muted">Логи отладки:</div>
+          <button id="btn-clear-log" style="padding: 2px 8px; font-size: 10px">
+            Очистить
+          </button>
+        </div>
+        <pre id="log"></pre>
+      </div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
