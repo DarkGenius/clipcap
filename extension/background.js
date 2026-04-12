@@ -178,15 +178,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
+// Извлечение m3u8 URL (прямой или из query-параметра прокси)
+function extractM3u8Url(fullUrl) {
+  // Случай 1: Прямая ссылка на .m3u8
+  const urlWithoutQuery = fullUrl.split("?")[0];
+  if (urlWithoutQuery.endsWith(".m3u8")) {
+    return { isM3u8: true, effectiveUrl: fullUrl, urlWithoutQuery };
+  }
+
+  // Случай 2: Прокси-ссылка с m3u8 URL в query-параметре
+  try {
+    const parsed = new URL(fullUrl);
+    for (const [, value] of parsed.searchParams) {
+      const valueWithoutQuery = value.split("?")[0];
+      if (valueWithoutQuery.endsWith(".m3u8")) {
+        return {
+          isM3u8: true,
+          effectiveUrl: value,
+          urlWithoutQuery: valueWithoutQuery,
+        };
+      }
+    }
+  } catch (e) {
+    // Некорректный URL, пропускаем
+  }
+
+  return { isM3u8: false };
+}
+
 // Отслеживание .m3u8 запросов
 chrome.webRequest.onBeforeRequest.addListener(
   async (details) => {
     const url = details.url;
-    // Убираем query-параметры
-    const urlWithoutQuery = url.split("?")[0];
+    const extracted = extractM3u8Url(url);
 
-    // Проверяем, заканчивается ли URL на .m3u8
-    if (urlWithoutQuery.endsWith(".m3u8")) {
+    if (extracted.isM3u8) {
       const tabId = details.tabId;
 
       // Получаем URL страницы из вкладки
@@ -207,7 +233,8 @@ chrome.webRequest.onBeforeRequest.addListener(
         if (!urls.some((item) => item.url === url)) {
           urls.push({
             url: url,
-            urlWithoutQuery: urlWithoutQuery,
+            effectiveUrl: extracted.effectiveUrl,
+            urlWithoutQuery: extracted.urlWithoutQuery,
             timestamp: new Date().toISOString(),
             tabId: tabId,
             pageUrl: pageUrl,

@@ -83,7 +83,7 @@ async function handleMessage(msg) {
         await log(`YT-DLP stdout (first 1000 chars): ${stdout.substring(0, 1000)}`); // Первые 1000 символов
 
         // Парсим вывод yt-dlp
-        const result = await parseYtDlpOutput(stdout);
+        const result = await parseYtDlpOutput(stdout, url);
         await log(`Parse result: success=${result.success}, resolution=${result.resolution}, filesize=${result.filesize}`);
 
         const response = {
@@ -142,13 +142,16 @@ async function handleMessage(msg) {
           const progressMatch = cleanOutput.match(/\[download\]\s+([\d.]+)%/);
           if (progressMatch) {
             const percent = parseFloat(progressMatch[1]);
-            // Отправляем обновление прогресса
-            writeMessage({
+            // Извлекаем размер файла из строки прогресса (например, "of ~ 1.49GiB" или "of 1.68GiB")
+            const sizeMatch = cleanOutput.match(/of\s+~?\s*([\d.]+\s*(?:B|KiB|MiB|GiB|TiB))/i);
+            const msg = {
               type: 'ytdlp-download-progress',
               url: url,
               percent: percent,
               output: cleanOutput
-            });
+            };
+            if (sizeMatch) msg.filesize = sizeMatch[1].trim();
+            writeMessage(msg);
           }
         });
 
@@ -162,12 +165,15 @@ async function handleMessage(msg) {
           const progressMatch = cleanOutput.match(/\[download\]\s+([\d.]+)%/);
           if (progressMatch) {
             const percent = parseFloat(progressMatch[1]);
-            writeMessage({
+            const sizeMatch = cleanOutput.match(/of\s+~?\s*([\d.]+\s*(?:B|KiB|MiB|GiB|TiB))/i);
+            const msg = {
               type: 'ytdlp-download-progress',
               url: url,
               percent: percent,
               output: cleanOutput
-            });
+            };
+            if (sizeMatch) msg.filesize = sizeMatch[1].trim();
+            writeMessage(msg);
           }
         });
 
@@ -251,7 +257,26 @@ async function handleMessage(msg) {
   }
 }
 
-async function parseYtDlpOutput(output) {
+// Пытаемся угадать разрешение по паттерну в URL (например, "1080p", "720p")
+function guessResolutionFromUrl(url) {
+  const heightMatch = url.match(/(\d{3,4})p(?:[_./?\s]|$)/i);
+  if (!heightMatch) return null;
+  const height = parseInt(heightMatch[1]);
+  const knownResolutions = {
+    2160: '3840x2160',
+    1440: '2560x1440',
+    1080: '1920x1080',
+    720: '1280x720',
+    480: '854x480',
+    360: '640x360',
+    240: '426x240',
+    144: '256x144',
+  };
+  const resolution = knownResolutions[height];
+  return resolution ? `${resolution} (?)` : `${height}p (?)`;
+}
+
+async function parseYtDlpOutput(output, url) {
   const lines = output.split('\n');
 
   // Ищем строки с разрешением (формат: ID EXT RESOLUTION ...)
@@ -264,19 +289,22 @@ async function parseYtDlpOutput(output) {
   let bestResolution = null;
   let bestFilesize = null;
   let maxPixels = 0;
+  let fallbackFormatId = null;
 
   await log(`Parsing yt-dlp output, total lines: ${lines.length}`);
 
   for (const line of lines) {
+    // Ищем ID формата в начале строки (первое число)
+    const formatIdMatch = line.match(/^(\d+)\s+/);
+    if (!formatIdMatch) continue;
+
+    const formatId = formatIdMatch[1];
+
     const resMatch = line.match(resolutionRegex);
     if (resMatch) {
       const resolution = resMatch[1];
       const [width, height] = resolution.split('x').map(Number);
       const pixels = width * height;
-
-      // Ищем ID формата в начале строки (первое число)
-      const formatIdMatch = line.match(/^(\d+)\s+/);
-      const formatId = formatIdMatch ? formatIdMatch[1] : null;
 
       // Ищем размер файла в этой же строке
       const sizeMatch = line.match(filesizeRegex);
@@ -290,6 +318,12 @@ async function parseYtDlpOutput(output) {
         bestResolution = resolution;
         bestFilesize = sizeMatch ? sizeMatch[0].trim() : null;
       }
+    } else {
+      // Формат без разрешения (например, HLS с "unknown") — запоминаем как fallback
+      if (!fallbackFormatId) {
+        fallbackFormatId = formatId;
+        await log(`Found format without resolution (fallback): formatId=${formatId}, line: ${line}`);
+      }
     }
   }
 
@@ -299,11 +333,24 @@ async function parseYtDlpOutput(output) {
       success: true,
       formatId: bestFormatId,
       resolution: bestResolution,
-      filesize: bestFilesize || 'неизвестен'
+      filesize: bestFilesize || null
     };
   }
 
-  await log('No resolution found in output');
+  // Fallback: формат найден, но разрешение неизвестно (типично для HLS)
+  if (fallbackFormatId) {
+    const guessedResolution = url ? guessResolutionFromUrl(url) : null;
+    const resolution = guessedResolution || 'unknown';
+    await log(`Using fallback format: id=${fallbackFormatId}, resolution=${resolution}`);
+    return {
+      success: true,
+      formatId: fallbackFormatId,
+      resolution,
+      filesize: null
+    };
+  }
+
+  await log('No formats found in output');
   return {
     success: false,
     error: 'Видеопоток не найден'

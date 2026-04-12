@@ -30,8 +30,9 @@ The extension communicates with the native host using Chrome's Native Messaging 
 
 **Extension Background Service Worker** (`extension/background.js:1`)
 - Maintains persistent connection to native host via `chrome.runtime.connectNative()`
-- Intercepts `.m3u8` requests using `chrome.webRequest` API (line 116)
-- Stores intercepted URLs in `chrome.storage.local` with page context
+- Intercepts `.m3u8` requests using `chrome.webRequest` API
+- Detects both direct `.m3u8` URLs and proxy/wrapped URLs (e.g., `m3u8.gammacdn.com/?u=...`) via `extractM3u8Url()` (line 181)
+- Stores intercepted URLs in `chrome.storage.local` with page context, including `effectiveUrl` for display
 - Forwards messages between popup and native host
 - Manages download progress state in storage for persistence across popup sessions
 
@@ -51,7 +52,8 @@ The extension communicates with the native host using Chrome's Native Messaging 
   - `host:ytdlp-cancel` - Kills active download process (line 213)
 - Maintains `downloadProcesses` Map for cancellation support (line 16)
 - Logs to `host.log` for debugging (line 11)
-- Parses yt-dlp output to extract best quality format (line 236)
+- Parses yt-dlp output to extract best quality format via `parseYtDlpOutput()` (line 275)
+- Falls back to URL-based resolution guessing via `guessResolutionFromUrl()` when yt-dlp reports "unknown" (common for HLS streams)
 
 ## Development Commands
 
@@ -125,12 +127,13 @@ All messages between extension and native host follow this structure:
   "ok": true,
   "url": "https://...",
   "success": true,
-  "resolution": "1920x1080",
-  "filesize": "1.68GiB",
+  "resolution": "1920x1080",    // or "1920x1080 (?)" when guessed, or "unknown"
+  "filesize": "1.68GiB",        // null when unknown
   "formatId": "6864",
-  "percent": 45.0,        // for progress
-  "filepath": "...",      // for completion
-  "error": "..."          // on failure
+  "percent": 45.0,              // for progress
+  "filesize": "1.49GiB",        // for progress (estimated, from yt-dlp output)
+  "filepath": "...",            // for completion
+  "error": "..."                // on failure
 }
 ```
 
@@ -141,7 +144,8 @@ All messages between extension and native host follow this structure:
 - `m3u8Urls` - Array of detected m3u8 URLs with metadata:
   ```javascript
   [{
-    url: "https://...",
+    url: "https://...",               // original URL (used as storage key)
+    effectiveUrl: "https://...",      // extracted inner URL for proxy URLs (used for display)
     urlWithoutQuery: "https://...without?params",
     timestamp: "2025-10-25T...",
     tabId: 123,
@@ -149,8 +153,9 @@ All messages between extension and native host follow this structure:
     checkResult: {
       success: true,
       formatId: "6864",
-      resolution: "1920x1080",
-      filesize: "1.68GiB",
+      resolution: "1920x1080",       // or "1920x1080 (?)" when guessed from URL
+      filesize: "1.68GiB",           // null when unknown, updated from download progress
+      unknownFilesize: false,         // true when filesize was not available at check time
       checkedAt: "2025-10-25T..."
     }
   }]
@@ -181,14 +186,17 @@ All messages between extension and native host follow this structure:
 
 The native host uses yt-dlp (youtube-dl fork) for video downloading.
 
-**Format Selection Algorithm** (`native-host/index.js:236`):
+**Format Selection Algorithm** (`native-host/index.js:275`):
 - Parses `yt-dlp --list-formats` output
 - Selects highest resolution format by pixel count
 - Extracts format ID, resolution, and file size
+- Falls back to formats with unknown resolution (common for HLS)
+- Guesses resolution from URL patterns (e.g., `1080p` → `1920x1080 (?)`)
 
-**Download Progress Parsing** (`native-host/index.js:142`):
+**Download Progress Parsing** (`native-host/index.js`):
 - Monitors stdout/stderr for `[download] XX.X%` patterns
-- Sends progress updates to extension in real-time
+- Extracts estimated filesize from progress output (e.g., `of ~ 1.49GiB`)
+- Sends progress updates with filesize to extension in real-time
 - Handles both regular and fragmented downloads
 
 **Arguments Used:**

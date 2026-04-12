@@ -5,6 +5,9 @@ A powerful Chrome browser extension for downloading streaming videos, with prima
 ## Features
 
 - Automatic detection of m3u8 video streams on web pages
+- Support for proxy/wrapped m3u8 URLs (e.g., `m3u8.gammacdn.com/?u=...`)
+- Resolution guessing from URL patterns when yt-dlp reports unknown (common for HLS)
+- Dynamic filesize estimation during download for streams with unknown size
 - Video quality selection and format information
 - Download progress tracking with real-time updates
 - Persistent downloads that survive popup close/reopen
@@ -240,10 +243,13 @@ ClipCap uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) for video downloading.
 
 - Automatically selects the highest resolution format by pixel count
 - Extracts format ID, resolution, and file size from `--list-formats` output
+- Falls back to formats with unknown resolution (common for HLS streams)
+- Guesses resolution from URL patterns (e.g., `1080p` in filename → `1920x1080 (?)`)
 
 **Progress Tracking:**
 
 - Monitors yt-dlp stdout/stderr for `[download] XX.X%` patterns
+- Extracts estimated filesize from progress output for streams with unknown size
 - Sends real-time progress updates to the extension
 - Handles both regular and fragmented downloads
 
@@ -253,6 +259,7 @@ ClipCap uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) for video downloading.
 
 - Check if the page actually uses m3u8/HLS streams
 - Open DevTools Network tab and filter for "m3u8" to verify
+- The extension detects both direct `.m3u8` URLs and proxy URLs with m3u8 links in query parameters
 - Check background service worker console for errors
 
 ### Native host connection fails
@@ -271,7 +278,7 @@ ClipCap uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) for video downloading.
 
 ## Security Considerations
 
-- The extension only intercepts m3u8 URLs (filtered by Chrome's webRequest API)
+- The extension intercepts m3u8 URLs (both direct and proxy-wrapped, filtered by Chrome's webRequest API)
 - User-controlled data (URLs) is properly escaped before DOM injection
 - Native host validates message structure before processing
 - Downloads are scoped to user-configured output directory
