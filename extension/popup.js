@@ -6,6 +6,7 @@ const m3u8CountEl = document.getElementById('m3u8-count');
 const currentPageEl = document.getElementById('current-page');
 const ytdlpPathInput = document.getElementById('ytdlp-path');
 const ytdlpOutputInput = document.getElementById('ytdlp-output');
+const showQueryParamsInput = document.getElementById('show-query-params');
 const btnSaveSettings = document.getElementById('btn-save-settings');
 const btnClearLog = document.getElementById('btn-clear-log');
 const btnOpenSettings = document.getElementById('btn-open-settings');
@@ -20,8 +21,21 @@ const btnRefreshDownloads = document.getElementById('btn-refresh-downloads');
 // Значения по умолчанию
 const DEFAULT_SETTINGS = {
   ytdlpPath: 'E:\\yt-dlp\\yt-dlp.exe',
-  ytdlpOutput: 'E:\\yt-dlp'
+  ytdlpOutput: 'E:\\yt-dlp',
+  showQueryParams: false
 };
+
+let currentSettings = { ...DEFAULT_SETTINGS };
+
+function stripQueryParams(url) {
+  if (!url) return url;
+  const i = url.indexOf('?');
+  return i === -1 ? url : url.substring(0, i);
+}
+
+function displayUrl(url) {
+  return currentSettings.showQueryParams ? url : stripQueryParams(url);
+}
 
 // Хранилище для обратных вызовов проверки URL
 const pendingChecks = new Map();
@@ -257,18 +271,22 @@ chrome.runtime.onMessage.addListener(async (msg) => {
 // Функции для работы с настройками
 async function loadSettings() {
   const result = await chrome.storage.local.get(['ytdlpSettings']);
-  const settings = result.ytdlpSettings || DEFAULT_SETTINGS;
+  const settings = { ...DEFAULT_SETTINGS, ...(result.ytdlpSettings || {}) };
   ytdlpPathInput.value = settings.ytdlpPath || DEFAULT_SETTINGS.ytdlpPath;
   ytdlpOutputInput.value = settings.ytdlpOutput || DEFAULT_SETTINGS.ytdlpOutput;
+  showQueryParamsInput.checked = !!settings.showQueryParams;
+  currentSettings = settings;
   return settings;
 }
 
 async function saveSettings() {
   const settings = {
     ytdlpPath: ytdlpPathInput.value || DEFAULT_SETTINGS.ytdlpPath,
-    ytdlpOutput: ytdlpOutputInput.value || DEFAULT_SETTINGS.ytdlpOutput
+    ytdlpOutput: ytdlpOutputInput.value || DEFAULT_SETTINGS.ytdlpOutput,
+    showQueryParams: !!showQueryParamsInput.checked
   };
   await chrome.storage.local.set({ ytdlpSettings: settings });
+  currentSettings = settings;
 
   // Визуальная обратная связь
   const originalText = btnSaveSettings.textContent;
@@ -278,6 +296,9 @@ async function saveSettings() {
     btnSaveSettings.textContent = originalText;
     btnSaveSettings.style.background = '';
   }, 1500);
+
+  await loadM3u8Urls();
+  await loadDownloads();
 }
 
 // Восстановить UI для активной загрузки
@@ -399,7 +420,7 @@ async function loadM3u8Urls() {
 
         return `
           <div class="m3u8-item" data-index="${index}" data-url="${escapeHtml(item.url)}" data-unknown-filesize="${unknownFilesize}">
-            <div class="url">${escapeHtml(effectiveUrl)}</div>
+            <div class="url">${escapeHtml(displayUrl(effectiveUrl))}</div>
             <div class="time">${timeStr}</div>
             <button class="check-btn" data-url="${escapeHtml(item.url)}">${btnText}</button>
             ${downloadBtn}
@@ -743,12 +764,13 @@ async function loadDownloads() {
   if (activeCount > 0) {
     downloadsHtml += '<div class="downloads-section"><h3>Активные загрузки</h3>';
     downloadsHtml += Object.entries(activeDownloads).map(([url, data], index) => {
-      const shortUrl = url.length > 80 ? url.substring(0, 80) + '...' : url;
+      const shownUrl = displayUrl(url);
+      const shortUrl = shownUrl.length > 80 ? shownUrl.substring(0, 80) + '...' : shownUrl;
       const percent = data.percent || 0;
 
       return `
         <div class="download-item active" data-url="${escapeHtml(url)}" data-index="${index}">
-          <div class="url" title="${escapeHtml(url)}">${escapeHtml(shortUrl)}</div>
+          <div class="url" title="${escapeHtml(shownUrl)}">${escapeHtml(shortUrl)}</div>
           <div class="filename">📁 ${escapeHtml(data.filename || 'video.mp4')} • ${data.resolution || 'неизвестно'}</div>
           <div class="progress">
             <div class="progress-bar">
@@ -767,13 +789,14 @@ async function loadDownloads() {
   if (completedCount > 0) {
     downloadsHtml += '<div class="downloads-section"><h3>Завершенные загрузки</h3>';
     downloadsHtml += Object.entries(completedDownloads).map(([url, data], index) => {
-      const shortUrl = url.length > 100 ? url.substring(0, 100) + '...' : url;
+      const shownUrl = displayUrl(url);
+      const shortUrl = shownUrl.length > 100 ? shownUrl.substring(0, 100) + '...' : shownUrl;
       const shortFilepath = data.filepath ? (data.filepath.length > 80 ? '...' + data.filepath.substring(data.filepath.length - 80) : data.filepath) : '';
 
       return `
         <div class="download-item completed" data-url="${escapeHtml(url)}" data-index="${index}">
           <button class="remove-btn" data-url="${escapeHtml(url)}" title="Удалить из списка">×</button>
-          <div class="url" title="${escapeHtml(url)}">${escapeHtml(shortUrl)}</div>
+          <div class="url" title="${escapeHtml(shownUrl)}">${escapeHtml(shortUrl)}</div>
           <div class="filename">✓ ${escapeHtml(data.filename || 'video.mp4')} • ${data.resolution || 'неизвестно'}</div>
           <div class="filepath" title="${escapeHtml(data.filepath || '')}">${escapeHtml(shortFilepath)}</div>
           <div class="completed-actions">
@@ -959,6 +982,8 @@ settingsModal.addEventListener('click', (e) => {
 initTabs();
 
 // Загружаем настройки и список при открытии popup
-loadSettings();
-loadM3u8Urls();
-loadDownloads(); // Загружаем счетчик активных загрузок
+(async () => {
+  await loadSettings();
+  await loadM3u8Urls();
+  await loadDownloads(); // Загружаем счетчик активных загрузок
+})();
