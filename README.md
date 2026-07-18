@@ -6,11 +6,13 @@ A powerful Chrome browser extension for downloading streaming videos, with prima
 
 - Automatic detection of m3u8 video streams on web pages
 - Support for proxy/wrapped m3u8 URLs (e.g., `m3u8.gammacdn.com/?u=...`)
+- Master playlist discovery: when a page only exposes HLS media playlists (e.g., `video_2.m3u8` with no resolution info), the sibling master playlist (`playlist.m3u8`, `master.m3u8`, ...) is located automatically, and each media playlist URL reports the exact resolution and size of its own variant
 - Resolution guessing from URL patterns when yt-dlp reports unknown (common for HLS)
 - Dynamic filesize estimation during download for streams with unknown size
 - Video quality selection and format information
 - Download progress tracking with real-time updates
 - Persistent downloads that survive popup close/reopen
+- Interrupted download detection (Refresh button on the Downloads tab) and resume from where it stopped (yt-dlp `.part` files)
 - Download cancellation support
 - Configurable output paths
 - Comprehensive logging for troubleshooting
@@ -60,7 +62,7 @@ yt-dlp binary (external)
 
    - Place `yt-dlp.exe` in a known location (e.g., `E:\yt-dlp\yt-dlp.exe`)
 
-2. **Node.js**: Required for the native host (version 14 or higher recommended)
+2. **Node.js**: Required for the native host (version 18 or higher — global `fetch` is used for master playlist discovery)
 
 ### Extension Setup
 
@@ -244,6 +246,7 @@ ClipCap uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) for video downloading.
 - Automatically selects the highest resolution format by pixel count
 - Extracts format ID, resolution, and file size from `--list-formats` output
 - Falls back to formats with unknown resolution (common for HLS streams)
+- Discovers the master playlist next to a media playlist (probes `playlist.m3u8`, `master.m3u8`, `index.m3u8`, `manifest.m3u8` with the same query string) and matches the checked URL to its specific variant to recover its exact resolution and size
 - Guesses resolution from URL patterns (e.g., `1080p` in filename → `1920x1080 (?)`)
 
 **Progress Tracking:**

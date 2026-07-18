@@ -47,6 +47,8 @@ const lastSavedFilesize = new Map();
 const ACTIVE_DOWNLOADS_KEY = 'activeDownloads';
 // Ключ для хранения завершенных загрузок
 const COMPLETED_DOWNLOADS_KEY = 'completedDownloads';
+// Ключ для хранения прерванных загрузок (хост перезапустился, процесс погиб)
+const INTERRUPTED_DOWNLOADS_KEY = 'interruptedDownloads';
 
 function log(msg) {
   logEl.textContent += (typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2)) + '\n';
@@ -72,6 +74,7 @@ async function saveCheckResult(url, result) {
           resolution: result.resolution,
           filesize: result.filesize || null,
           unknownFilesize: !result.filesize,
+          downloadUrl: result.downloadUrl || null,
           error: result.error,
           checkedAt: new Date().toISOString()
         }
@@ -100,9 +103,9 @@ chrome.runtime.onMessage.addListener(async (msg) => {
   if (msg?.source === 'native-host') {
     // Обработка ответа от yt-dlp проверки
     if (msg.payload?.type === 'ytdlp-check-result') {
-      const { url, success, formatId, resolution, filesize, error } = msg.payload;
+      const { url, success, formatId, resolution, filesize, downloadUrl, error } = msg.payload;
 
-      const result = { success, formatId, resolution, filesize, error };
+      const result = { success, formatId, resolution, filesize, downloadUrl, error };
 
       // Сохраняем результат в storage
       await saveCheckResult(url, result);
@@ -135,8 +138,9 @@ chrome.runtime.onMessage.addListener(async (msg) => {
             downloadBtn.setAttribute('data-url', url);
             downloadBtn.setAttribute('data-formatid', formatId || '');
             downloadBtn.setAttribute('data-resolution', resolution);
+            downloadBtn.setAttribute('data-download-url', downloadUrl || '');
             downloadBtn.addEventListener('click', async (e) => {
-              await downloadM3u8(url, formatId, resolution, e.target);
+              await downloadM3u8(url, formatId, resolution, e.target, downloadUrl);
             });
             btn.parentElement.insertBefore(downloadBtn, btn.nextSibling);
           }
@@ -410,7 +414,7 @@ async function loadM3u8Urls() {
           if (item.checkResult.success && item.checkResult.resolution) {
             infoHtml = `<div class="info success">Разрешение: ${item.checkResult.resolution}, Размер: ${item.checkResult.filesize || 'неизвестен'}</div>`;
             // Добавляем кнопку скачать если проверка успешна
-            downloadBtn = `<button class="download-btn" data-url="${escapeHtml(item.url)}" data-formatid="${item.checkResult.formatId || ''}" data-resolution="${item.checkResult.resolution}">Скачать</button>`;
+            downloadBtn = `<button class="download-btn" data-url="${escapeHtml(item.url)}" data-formatid="${item.checkResult.formatId || ''}" data-resolution="${item.checkResult.resolution}" data-download-url="${escapeHtml(item.checkResult.downloadUrl || '')}">Скачать</button>`;
           } else {
             infoHtml = `<div class="info error">${item.checkResult.error || 'Видеопоток не найден'}</div>`;
           }
@@ -445,7 +449,8 @@ async function loadM3u8Urls() {
         const url = e.target.getAttribute('data-url');
         const formatId = e.target.getAttribute('data-formatid');
         const resolution = e.target.getAttribute('data-resolution');
-        await downloadM3u8(url, formatId, resolution, e.target);
+        const downloadUrl = e.target.getAttribute('data-download-url') || null;
+        await downloadM3u8(url, formatId, resolution, e.target, downloadUrl);
       });
     });
 
@@ -540,8 +545,9 @@ async function checkM3u8Url(url, btnElement) {
         downloadBtn.setAttribute('data-url', url);
         downloadBtn.setAttribute('data-formatid', result.formatId || '');
         downloadBtn.setAttribute('data-resolution', result.resolution);
+        downloadBtn.setAttribute('data-download-url', result.downloadUrl || '');
         downloadBtn.addEventListener('click', async (e) => {
-          await downloadM3u8(url, result.formatId, result.resolution, e.target);
+          await downloadM3u8(url, result.formatId, result.resolution, e.target, result.downloadUrl);
         });
         btnElement.parentElement.insertBefore(downloadBtn, btnElement.nextSibling);
       }
@@ -615,6 +621,78 @@ async function getCompletedDownloads() {
   return result[COMPLETED_DOWNLOADS_KEY] || {};
 }
 
+// Получить все прерванные загрузки
+async function getInterruptedDownloads() {
+  const result = await chrome.storage.local.get([INTERRUPTED_DOWNLOADS_KEY]);
+  return result[INTERRUPTED_DOWNLOADS_KEY] || {};
+}
+
+// Удалить прерванную загрузку
+async function removeInterruptedDownload(url) {
+  const interrupted = await getInterruptedDownloads();
+  delete interrupted[url];
+  await chrome.storage.local.set({ [INTERRUPTED_DOWNLOADS_KEY]: interrupted });
+}
+
+// Запросить у хоста список реально идущих загрузок и перенести зависшие
+// записи activeDownloads в interruptedDownloads. Возвращает число прерванных
+async function invalidateStaleDownloads() {
+  const activeDownloads = await getActiveDownloads();
+  if (Object.keys(activeDownloads).length === 0) return 0;
+
+  try {
+    await ensureConnect();
+    await chrome.storage.local.remove(['ytdlp-status-result']);
+
+    const sendResult = await chrome.runtime.sendMessage({ type: 'host:ytdlp-status' });
+    if (!sendResult || !sendResult.ok) {
+      throw new Error(sendResult?.error || 'хост недоступен');
+    }
+
+    // Ждем результат в storage (background сохраняет его туда)
+    let status = null;
+    for (let i = 0; i < 10; i++) {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const result = await chrome.storage.local.get(['ytdlp-status-result']);
+      if (result['ytdlp-status-result']) {
+        status = result['ytdlp-status-result'];
+        break;
+      }
+    }
+    if (!status) {
+      throw new Error('таймаут ожидания статуса от хоста');
+    }
+    await chrome.storage.local.remove(['ytdlp-status-result']);
+
+    const reallyActive = new Set(status.activeUrls || []);
+    const interrupted = await getInterruptedDownloads();
+    let staleCount = 0;
+
+    for (const [url, data] of Object.entries(activeDownloads)) {
+      if (!reallyActive.has(url)) {
+        interrupted[url] = {
+          ...data,
+          interruptedAt: new Date().toISOString()
+        };
+        delete activeDownloads[url];
+        staleCount++;
+        log(`Загрузка помечена как прерванная: ${url.substring(0, 80)}... (${data.percent || 0}%)`);
+      }
+    }
+
+    if (staleCount > 0) {
+      await chrome.storage.local.set({
+        [ACTIVE_DOWNLOADS_KEY]: activeDownloads,
+        [INTERRUPTED_DOWNLOADS_KEY]: interrupted
+      });
+    }
+    return staleCount;
+  } catch (err) {
+    log(`Не удалось проверить статус загрузок: ${err.message}`);
+    return 0;
+  }
+}
+
 async function cancelDownload(url, cancelBtn) {
   try {
     cancelBtn.disabled = true;
@@ -642,7 +720,7 @@ async function cancelDownload(url, cancelBtn) {
   }
 }
 
-async function downloadM3u8(url, formatId, resolution, btnElement) {
+async function downloadM3u8(url, formatId, resolution, btnElement, downloadUrl) {
   const progressContainer = btnElement.parentElement.querySelector('.progress-container');
   const infoContainer = btnElement.parentElement.querySelector('.info-container');
 
@@ -658,10 +736,20 @@ async function downloadM3u8(url, formatId, resolution, btnElement) {
     // Получаем настройки
     const settings = await loadSettings();
 
-    // Генерируем имя файла
-    const resolutionShort = resolution.includes('x') ? resolution.split('x')[1].replace(/\D+$/g, '') : resolution.replace(/\D+$/g, ''); // Берем только высоту (например, 1080 из 1920x1080)
-    const timestamp = Date.now();
-    const filename = `video_${resolutionShort}_${timestamp}.mp4`;
+    // Если для этого URL есть прерванная загрузка — используем то же имя файла,
+    // чтобы yt-dlp продолжил с места обрыва, а не начал заново
+    const interrupted = await getInterruptedDownloads();
+    const interruptedData = interrupted[url];
+    let filename;
+    if (interruptedData?.filename) {
+      filename = interruptedData.filename;
+      log(`Возобновление прерванной загрузки: ${filename} (с ${(interruptedData.percent || 0).toFixed(1)}%)`);
+    } else {
+      // Генерируем имя файла
+      const resolutionShort = resolution.includes('x') ? resolution.split('x')[1].replace(/\D+$/g, '') : resolution.replace(/\D+$/g, ''); // Берем только высоту (например, 1080 из 1920x1080)
+      const timestamp = Date.now();
+      filename = `video_${resolutionShort}_${timestamp}.mp4`;
+    }
 
     // Показываем индикатор загрузки с кнопкой отмены
     progressContainer.innerHTML = `
@@ -688,6 +776,7 @@ async function downloadM3u8(url, formatId, resolution, btnElement) {
       ytdlpPath: settings.ytdlpPath,
       formatId: formatId,
       url: url,
+      downloadUrl: downloadUrl || undefined,
       outputPath: settings.ytdlpOutput,
       filename: filename
     });
@@ -696,12 +785,17 @@ async function downloadM3u8(url, formatId, resolution, btnElement) {
       throw new Error('Не удалось запустить загрузку: ' + (sendResult?.error || 'неизвестная ошибка'));
     }
 
+    // Загрузка стартовала — убираем запись из прерванных (если была)
+    if (interruptedData) {
+      await removeInterruptedDownload(url);
+    }
+
     // Сохраняем активную загрузку в storage
     await saveActiveDownload(url, {
       formatId,
       resolution,
       filename,
-      percent: 0
+      percent: interruptedData?.percent || 0
     });
 
     // Обновляем счетчик активных загрузок
@@ -747,13 +841,15 @@ function escapeHtml(text) {
 async function loadDownloads() {
   const activeDownloads = await getActiveDownloads();
   const completedDownloads = await getCompletedDownloads();
+  const interruptedDownloads = await getInterruptedDownloads();
   const activeCount = Object.keys(activeDownloads).length;
   const completedCount = Object.keys(completedDownloads).length;
+  const interruptedCount = Object.keys(interruptedDownloads).length;
 
   // Обновляем счетчик в заголовке вкладки (только активные)
   activeDownloadsCountEl.textContent = activeCount;
 
-  if (activeCount === 0 && completedCount === 0) {
+  if (activeCount === 0 && completedCount === 0 && interruptedCount === 0) {
     downloadsListEl.innerHTML = '<div class="empty-state">Нет загрузок</div>';
     return;
   }
@@ -778,6 +874,28 @@ async function loadDownloads() {
               <div class="progress-text">${percent.toFixed(1)}%</div>
             </div>
             <button class="cancel-btn" data-url="${escapeHtml(url)}">Отменить</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+    downloadsHtml += '</div>';
+  }
+
+  // Формируем HTML для прерванных загрузок
+  if (interruptedCount > 0) {
+    downloadsHtml += '<div class="downloads-section"><h3>Прерванные загрузки</h3>';
+    downloadsHtml += Object.entries(interruptedDownloads).map(([url, data], index) => {
+      const shownUrl = displayUrl(url);
+      const shortUrl = shownUrl.length > 80 ? shownUrl.substring(0, 80) + '...' : shownUrl;
+      const percent = data.percent || 0;
+
+      return `
+        <div class="download-item interrupted" data-url="${escapeHtml(url)}" data-index="${index}">
+          <button class="remove-btn interrupted-remove-btn" data-url="${escapeHtml(url)}" title="Удалить из списка">×</button>
+          <div class="url" title="${escapeHtml(shownUrl)}">${escapeHtml(shortUrl)}</div>
+          <div class="filename">⏸ ${escapeHtml(data.filename || 'video.mp4')} • ${data.resolution || 'неизвестно'} • остановлена на ${percent.toFixed(1)}%</div>
+          <div class="completed-actions">
+            <button class="resume-btn" data-url="${escapeHtml(url)}">Продолжить</button>
           </div>
         </div>
       `;
@@ -820,12 +938,31 @@ async function loadDownloads() {
   });
 
   // Добавляем обработчики для кнопок удаления (завершенные загрузки)
-  const removeButtons = downloadsListEl.querySelectorAll('.remove-btn');
+  const removeButtons = downloadsListEl.querySelectorAll('.download-item.completed .remove-btn');
   removeButtons.forEach(btn => {
     btn.addEventListener('click', async () => {
       const url = btn.getAttribute('data-url');
       await removeCompletedDownload(url);
       await loadDownloads(); // Обновляем список
+    });
+  });
+
+  // Добавляем обработчики для кнопок удаления (прерванные загрузки)
+  const interruptedRemoveButtons = downloadsListEl.querySelectorAll('.interrupted-remove-btn');
+  interruptedRemoveButtons.forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const url = btn.getAttribute('data-url');
+      await removeInterruptedDownload(url);
+      await loadDownloads();
+    });
+  });
+
+  // Добавляем обработчики для кнопок продолжения (прерванные загрузки)
+  const resumeButtons = downloadsListEl.querySelectorAll('.resume-btn');
+  resumeButtons.forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const url = btn.getAttribute('data-url');
+      await resumeDownload(url, btn);
     });
   });
 
@@ -837,6 +974,61 @@ async function loadDownloads() {
       await openFile(filepath, btn);
     });
   });
+}
+
+// Возобновление прерванной загрузки: то же имя файла — yt-dlp продолжит
+// с места обрыва по своим .part/.ytdl файлам
+async function resumeDownload(url, btn) {
+  const interrupted = await getInterruptedDownloads();
+  const data = interrupted[url];
+  if (!data || !data.filename) {
+    log(`Нет данных для возобновления загрузки: ${url}`);
+    return;
+  }
+
+  try {
+    btn.disabled = true;
+    btn.textContent = 'Запуск...';
+
+    await ensureConnect();
+    const settings = await loadSettings();
+
+    // Достаем downloadUrl из результата проверки (для мастер-плейлистов)
+    const storageResult = await chrome.storage.local.get(['m3u8Urls']);
+    const urlItem = (storageResult.m3u8Urls || []).find(item => item.url === url);
+    const downloadUrl = urlItem?.checkResult?.downloadUrl || undefined;
+
+    const sendResult = await chrome.runtime.sendMessage({
+      type: 'host:ytdlp-download',
+      ytdlpPath: settings.ytdlpPath,
+      formatId: data.formatId,
+      url: url,
+      downloadUrl: downloadUrl,
+      outputPath: settings.ytdlpOutput,
+      filename: data.filename
+    });
+
+    if (!sendResult || !sendResult.ok) {
+      throw new Error(sendResult?.error || 'неизвестная ошибка');
+    }
+
+    // Переносим из прерванных обратно в активные
+    await removeInterruptedDownload(url);
+    await saveActiveDownload(url, {
+      formatId: data.formatId,
+      resolution: data.resolution,
+      filename: data.filename,
+      percent: data.percent || 0
+    });
+
+    log(`Загрузка возобновлена: ${data.filename} (с ${(data.percent || 0).toFixed(1)}%)`);
+    await loadDownloads();
+
+  } catch (err) {
+    log(`Ошибка возобновления: ${err.message}`);
+    btn.disabled = false;
+    btn.textContent = 'Продолжить';
+  }
 }
 
 // Отмена загрузки из списка загрузок
@@ -955,7 +1147,15 @@ function toggleLogs() {
 
 btnRefreshM3u8.addEventListener('click', loadM3u8Urls);
 btnClearM3u8.addEventListener('click', clearM3u8Urls);
-btnRefreshDownloads.addEventListener('click', loadDownloads);
+btnRefreshDownloads.addEventListener('click', async () => {
+  // Сверяем activeDownloads с реально идущими загрузками на хосте:
+  // зависшие (например, после перезагрузки расширения) переносим в прерванные
+  const staleCount = await invalidateStaleDownloads();
+  if (staleCount > 0) {
+    log(`Прервано загрузок: ${staleCount} (их можно возобновить)`);
+  }
+  await loadDownloads();
+});
 btnOpenSettings.addEventListener('click', openSettings);
 btnCloseSettings.addEventListener('click', closeSettings);
 btnSaveSettings.addEventListener('click', async () => {

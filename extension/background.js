@@ -5,6 +5,8 @@ let port = null;
 const ACTIVE_DOWNLOADS_KEY = "activeDownloads";
 // Ключ для хранения завершенных загрузок
 const COMPLETED_DOWNLOADS_KEY = "completedDownloads";
+// Ключ для хранения прерванных загрузок
+const INTERRUPTED_DOWNLOADS_KEY = "interruptedDownloads";
 
 function connect() {
   if (port) return;
@@ -19,6 +21,17 @@ function connect() {
       await chrome.storage.local.set({
         [`ytdlp-result-${msg.url}`]: msg,
       });
+    }
+
+    // Сохраняем результат запроса статуса загрузок в storage
+    // (popup читает его через polling, как и результаты проверки)
+    if (msg?.type === "ytdlp-status-result") {
+      console.log(
+        "[Background] Saving ytdlp status to storage:",
+        msg.activeUrls?.length || 0,
+        "active"
+      );
+      await chrome.storage.local.set({ "ytdlp-status-result": msg });
     }
 
     // Обрабатываем сообщения о прогрессе загрузки
@@ -64,9 +77,11 @@ function connect() {
       const result = await chrome.storage.local.get([
         ACTIVE_DOWNLOADS_KEY,
         COMPLETED_DOWNLOADS_KEY,
+        INTERRUPTED_DOWNLOADS_KEY,
       ]);
       const activeDownloads = result[ACTIVE_DOWNLOADS_KEY] || {};
       const completedDownloads = result[COMPLETED_DOWNLOADS_KEY] || {};
+      const interruptedDownloads = result[INTERRUPTED_DOWNLOADS_KEY] || {};
 
       // Если загрузка была активной
       if (activeDownloads[msg.url]) {
@@ -84,6 +99,18 @@ function connect() {
             "[Background] Saved completed download to storage:",
             msg.url
           );
+        } else if (msg.error !== "Загрузка отменена") {
+          // Ошибка (не отмена) — сохраняем в прерванные, чтобы можно было
+          // возобновить с тем же именем файла (yt-dlp докачает по .part/.ytdl)
+          interruptedDownloads[msg.url] = {
+            ...downloadData,
+            interruptedAt: new Date().toISOString(),
+          };
+          console.log(
+            "[Background] Saved failed download as interrupted:",
+            msg.url,
+            msg.error
+          );
         }
 
         // Удаляем из активных загрузок
@@ -93,6 +120,7 @@ function connect() {
         await chrome.storage.local.set({
           [ACTIVE_DOWNLOADS_KEY]: activeDownloads,
           [COMPLETED_DOWNLOADS_KEY]: completedDownloads,
+          [INTERRUPTED_DOWNLOADS_KEY]: interruptedDownloads,
         });
         console.log(
           "[Background] Removed from active downloads:",
@@ -141,6 +169,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message?.type === "host:ytdlp-check" ||
     message?.type === "host:ytdlp-download" ||
     message?.type === "host:ytdlp-cancel" ||
+    message?.type === "host:ytdlp-status" ||
     message?.type === "host:open-file"
   ) {
     console.log(

@@ -14,6 +14,8 @@ const execFileAsync = promisify(execFile);
 
 // Храним активные процессы загрузки
 const downloadProcesses = new Map();
+// URL, для которых была запрошена отмена (чтобы корректно определить причину завершения)
+const cancelledDownloads = new Set();
 
 // Функция логирования
 async function log(message) {
@@ -83,14 +85,38 @@ async function handleMessage(msg) {
         await log(`YT-DLP stdout (first 1000 chars): ${stdout.substring(0, 1000)}`); // Первые 1000 символов
 
         // Парсим вывод yt-dlp
-        const result = await parseYtDlpOutput(stdout, url);
+        let result = await parseYtDlpOutput(stdout, url);
         await log(`Parse result: success=${result.success}, resolution=${result.resolution}, filesize=${result.filesize}`);
+
+        // Если разрешение не определено точно (unknown или угадано по URL),
+        // пробуем найти мастер-плейлист рядом с медиа-плейлистом
+        let downloadUrl = null;
+        if (result.success && !/^\d+x\d+$/.test(result.resolution || '')) {
+          const master = await findMasterPlaylist(url);
+          // Используем мастер только если удалось определить, какому варианту
+          // соответствует проверяемый URL — иначе показывали бы чужое разрешение
+          if (master && master.variantResolution) {
+            await log(`Re-checking with master playlist: ${master.masterUrl} (variant: ${master.variantResolution})`);
+            try {
+              const { stdout: masterStdout } = await execFileAsync(ytdlpPath, ['--list-formats', master.masterUrl], { timeout: 30000 });
+              const masterResult = await parseYtDlpOutput(masterStdout, master.masterUrl, master.variantResolution);
+              if (masterResult.success && masterResult.resolution === master.variantResolution) {
+                result = masterResult;
+                downloadUrl = master.masterUrl;
+                await log(`Master playlist result: resolution=${result.resolution}, filesize=${result.filesize}, formatId=${result.formatId}`);
+              }
+            } catch (masterErr) {
+              await log(`Master playlist check failed: ${masterErr.message || String(masterErr)}`);
+            }
+          }
+        }
 
         const response = {
           ok: true,
           kind: 'ytdlp-check',
           type: 'ytdlp-check-result',
           url: url,
+          downloadUrl: downloadUrl,
           success: result.success,
           formatId: result.formatId,
           resolution: result.resolution,
@@ -114,13 +140,16 @@ async function handleMessage(msg) {
       }
     }
     if (msg.type === 'host:ytdlp-download') {
-      const { ytdlpPath, formatId, url, outputPath, filename } = msg;
-      await log(`YT-DLP download: formatId=${formatId}, url=${url}, output=${outputPath}/${filename}`);
+      const { ytdlpPath, formatId, url, downloadUrl, outputPath, filename } = msg;
+      // downloadUrl — альтернативный URL для yt-dlp (например, мастер-плейлист),
+      // при этом url остается ключом для прогресса и отмены
+      const targetUrl = downloadUrl || url;
+      await log(`YT-DLP download: formatId=${formatId}, url=${url}, targetUrl=${targetUrl}, output=${outputPath}/${filename}`);
 
       try {
         const fullPath = join(outputPath, filename);
         // Добавляем --newline для корректного вывода прогресса и --no-warnings чтобы игнорировать предупреждения
-        const args = ['-f', formatId, url, '-o', fullPath, '--newline', '--no-warnings'];
+        const args = ['-f', formatId, targetUrl, '-o', fullPath, '--newline', '--no-warnings'];
 
         await log(`Spawning yt-dlp: ${ytdlpPath} ${args.join(' ')}`);
 
@@ -150,7 +179,7 @@ async function handleMessage(msg) {
               percent: percent,
               output: cleanOutput
             };
-            if (sizeMatch) msg.filesize = sizeMatch[1].trim();
+            if (sizeMatch) msg.filesize = sizeMatch[1].trim().replace(/\s+/g, '');
             writeMessage(msg);
           }
         });
@@ -172,7 +201,7 @@ async function handleMessage(msg) {
               percent: percent,
               output: cleanOutput
             };
-            if (sizeMatch) msg.filesize = sizeMatch[1].trim();
+            if (sizeMatch) msg.filesize = sizeMatch[1].trim().replace(/\s+/g, '');
             writeMessage(msg);
           }
         });
@@ -181,6 +210,8 @@ async function handleMessage(msg) {
           await log(`YT-DLP download finished with code: ${code}`);
           downloadProcesses.delete(url);
 
+          const wasCancelled = cancelledDownloads.delete(url);
+
           if (code === 0) {
             writeMessage({
               type: 'ytdlp-download-complete',
@@ -188,7 +219,7 @@ async function handleMessage(msg) {
               success: true,
               filepath: fullPath
             });
-          } else if (code === null) {
+          } else if (code === null || wasCancelled) {
             // Процесс был убит
             writeMessage({
               type: 'ytdlp-download-complete',
@@ -216,14 +247,39 @@ async function handleMessage(msg) {
         };
       }
     }
+    if (msg.type === 'host:ytdlp-status') {
+      // Возвращаем список URL, для которых в ЭТОМ экземпляре хоста реально идет загрузка.
+      // После перезапуска хоста (перезагрузка расширения) список пуст —
+      // расширение использует это для инвалидации зависших загрузок
+      const activeUrls = Array.from(downloadProcesses.keys());
+      await log(`YT-DLP status: ${activeUrls.length} active download(s)`);
+      return {
+        ok: true,
+        kind: 'ytdlp-status',
+        type: 'ytdlp-status-result',
+        activeUrls: activeUrls
+      };
+    }
     if (msg.type === 'host:ytdlp-cancel') {
       const { url } = msg;
       await log(`YT-DLP cancel download: url=${url}`);
 
       const child = downloadProcesses.get(url);
       if (child) {
-        await log(`Killing process for ${url}`);
-        child.kill('SIGTERM');
+        await log(`Killing process for ${url} (pid=${child.pid})`);
+        cancelledDownloads.add(url);
+        if (process.platform === 'win32') {
+          // yt-dlp.exe (PyInstaller) порождает дочерний процесс — убиваем все дерево,
+          // иначе child.kill() завершает только родителя, а загрузка продолжается
+          try {
+            await execFileAsync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { timeout: 5000 });
+          } catch (killErr) {
+            await log(`taskkill failed: ${killErr.message || String(killErr)}, falling back to child.kill()`);
+            child.kill('SIGTERM');
+          }
+        } else {
+          child.kill('SIGTERM');
+        }
         downloadProcesses.delete(url);
         return { ok: true, kind: 'ytdlp-cancel', message: 'Download cancelled' };
       } else {
@@ -257,6 +313,83 @@ async function handleMessage(msg) {
   }
 }
 
+// Типичные имена мастер-плейлистов HLS
+const MASTER_PLAYLIST_NAMES = ['playlist.m3u8', 'master.m3u8', 'index.m3u8', 'manifest.m3u8'];
+
+async function fetchText(url, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch (err) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Ищем в мастер-плейлисте вариант с указанным именем файла и возвращаем его разрешение
+function findVariantResolution(masterContent, mediaFilename) {
+  const lines = masterContent.split('\n').map(l => l.trim());
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+    // Следующая непустая строка без # — URI варианта
+    for (let j = i + 1; j < lines.length; j++) {
+      const uriLine = lines[j];
+      if (!uriLine) continue;
+      if (uriLine.startsWith('#')) break;
+      const uriFilename = uriLine.split('?')[0].split('/').pop();
+      if (uriFilename === mediaFilename) {
+        const resMatch = lines[i].match(/RESOLUTION=(\d+x\d+)/);
+        return resMatch ? resMatch[1] : null;
+      }
+      break;
+    }
+  }
+  return null;
+}
+
+// Если URL указывает на медиа-плейлист (конкретное качество без информации о разрешении),
+// пробуем найти мастер-плейлист в той же директории с теми же query-параметрами.
+// Возвращает { masterUrl, variantResolution } — разрешение именно того варианта,
+// на который указывает исходный URL (или null, если вариант не найден в мастере)
+async function findMasterPlaylist(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (e) {
+    return null;
+  }
+  const filename = parsed.pathname.split('/').pop();
+  if (!filename || !filename.endsWith('.m3u8')) return null;
+
+  const content = await fetchText(url);
+  if (!content || !content.trimStart().startsWith('#EXTM3U')) return null;
+  if (content.includes('#EXT-X-STREAM-INF')) {
+    // Это уже мастер-плейлист
+    return null;
+  }
+  await log(`URL is a media playlist, probing for master playlist: ${url}`);
+
+  const dirPath = parsed.pathname.slice(0, parsed.pathname.length - filename.length);
+  for (const name of MASTER_PLAYLIST_NAMES) {
+    if (name === filename) continue;
+    const candidate = new URL(url);
+    candidate.pathname = dirPath + name;
+    const candidateUrl = candidate.toString();
+    const candidateContent = await fetchText(candidateUrl);
+    if (candidateContent && candidateContent.trimStart().startsWith('#EXTM3U') && candidateContent.includes('#EXT-X-STREAM-INF')) {
+      const variantResolution = findVariantResolution(candidateContent, filename);
+      await log(`Master playlist found: ${candidateUrl}, variant ${filename} resolution: ${variantResolution}`);
+      return { masterUrl: candidateUrl, variantResolution };
+    }
+  }
+  await log('Master playlist not found');
+  return null;
+}
+
 // Пытаемся угадать разрешение по паттерну в URL (например, "1080p", "720p")
 function guessResolutionFromUrl(url) {
   const heightMatch = url.match(/(\d{3,4})p(?:[_./?\s]|$)/i);
@@ -276,7 +409,7 @@ function guessResolutionFromUrl(url) {
   return resolution ? `${resolution} (?)` : `${height}p (?)`;
 }
 
-async function parseYtDlpOutput(output, url) {
+async function parseYtDlpOutput(output, url, targetResolution) {
   const lines = output.split('\n');
 
   // Ищем строки с разрешением (формат: ID EXT RESOLUTION ...)
@@ -290,8 +423,9 @@ async function parseYtDlpOutput(output, url) {
   let bestFilesize = null;
   let maxPixels = 0;
   let fallbackFormatId = null;
+  let targetMatched = false;
 
-  await log(`Parsing yt-dlp output, total lines: ${lines.length}`);
+  await log(`Parsing yt-dlp output, total lines: ${lines.length}${targetResolution ? `, target resolution: ${targetResolution}` : ''}`);
 
   for (const line of lines) {
     // Ищем ID формата в начале строки (первое число)
@@ -311,12 +445,18 @@ async function parseYtDlpOutput(output, url) {
 
       await log(`Found resolution: ${resolution}, formatId: ${formatId}, filesize: ${sizeMatch ? sizeMatch[0] : 'not found'}, line: ${line}`);
 
-      // Выбираем максимальное разрешение
-      if (pixels > maxPixels) {
+      // Если задано целевое разрешение (конкретный вариант из мастер-плейлиста) —
+      // выбираем именно его, иначе максимальное по пикселям
+      if (targetResolution && resolution === targetResolution && !targetMatched) {
+        targetMatched = true;
+        bestFormatId = formatId;
+        bestResolution = resolution;
+        bestFilesize = sizeMatch ? sizeMatch[0].trim().replace(/\s+/g, '') : null;
+      } else if (!targetMatched && pixels > maxPixels) {
         maxPixels = pixels;
         bestFormatId = formatId;
         bestResolution = resolution;
-        bestFilesize = sizeMatch ? sizeMatch[0].trim() : null;
+        bestFilesize = sizeMatch ? sizeMatch[0].trim().replace(/\s+/g, '') : null;
       }
     } else {
       // Формат без разрешения (например, HLS с "unknown") — запоминаем как fallback

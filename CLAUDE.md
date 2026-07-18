@@ -42,18 +42,22 @@ The extension communicates with the native host using Chrome's Native Messaging 
 - Sends `host:ytdlp-download` messages to start downloads with progress tracking
 - Handles download cancellation via `host:ytdlp-cancel`
 - Persists active downloads in storage to survive popup close/reopen
+- **Stale download invalidation**: the Refresh button on the Downloads tab calls `invalidateStaleDownloads()` — queries the host via `host:ytdlp-status` and moves `activeDownloads` entries the host doesn't know about (e.g., after extension reload) into `interruptedDownloads`, shown in a "Прерванные загрузки" section
+- **Resume support**: interrupted downloads keep their filename; "Продолжить" (or re-clicking "Скачать" for a URL with an interrupted entry) restarts yt-dlp with the SAME output filename, so yt-dlp resumes from its `.part`/`.ytdl` files instead of starting over. Failed (non-cancelled) downloads are also moved to interrupted by background.js for the same reason
 
 **Native Host** (`native-host/index.js:1`)
-- Node.js script that implements Native Messaging protocol
-- Reads 4-byte length header + JSON message from stdin (line 30)
+- Node.js script that implements Native Messaging protocol (requires Node 18+ for global `fetch`)
+- Reads 4-byte length header + JSON message from stdin
 - Handles message types:
-  - `host:ytdlp-check` - Runs `yt-dlp --list-formats` and parses output (line 76)
-  - `host:ytdlp-download` - Spawns `yt-dlp` with progress monitoring (line 116)
-  - `host:ytdlp-cancel` - Kills active download process (line 213)
-- Maintains `downloadProcesses` Map for cancellation support (line 16)
-- Logs to `host.log` for debugging (line 11)
-- Parses yt-dlp output to extract best quality format via `parseYtDlpOutput()` (line 275)
-- Falls back to URL-based resolution guessing via `guessResolutionFromUrl()` when yt-dlp reports "unknown" (common for HLS streams)
+  - `host:ytdlp-check` - Runs `yt-dlp --list-formats` and parses output
+  - `host:ytdlp-download` - Spawns `yt-dlp` with progress monitoring
+  - `host:ytdlp-cancel` - Kills active download process (on Windows uses `taskkill /T /F` to kill the whole process tree, since yt-dlp.exe is a PyInstaller bundle that spawns a child process)
+  - `host:ytdlp-status` - Returns `activeUrls` list of downloads running in THIS host instance; used by the popup to detect stale downloads after a host restart (extension reload kills the host and its yt-dlp children)
+- Maintains `downloadProcesses` Map for cancellation support and `cancelledDownloads` Set to report cancellation correctly on close
+- Logs to `host.log` for debugging
+- Parses yt-dlp output to extract best quality format via `parseYtDlpOutput()`
+- **Master playlist discovery** via `findMasterPlaylist()`: when the checked URL is an HLS media playlist (single variant, no resolution info — e.g., `video_2.m3u8`), probes sibling filenames (`playlist.m3u8`, `master.m3u8`, `index.m3u8`, `manifest.m3u8`) with the same query string. If a master playlist (`#EXT-X-STREAM-INF`) is found, matches the checked filename against variant URIs in the master (`findVariantResolution()`) to determine which resolution THIS URL corresponds to, re-runs the check on the master, and selects exactly that variant's format (each `video_N.m3u8` reports its own resolution/size, not the best one). The master URL is returned as `downloadUrl` in the check result; the extension passes it back in `host:ytdlp-download`, while progress/cancel remain keyed by the original `url`. If the variant can't be matched, the master is not used.
+- Falls back to URL-based resolution guessing via `guessResolutionFromUrl()` when yt-dlp reports "unknown" and no master playlist is found
 
 ## Development Commands
 
@@ -113,7 +117,8 @@ All messages between extension and native host follow this structure:
 {
   "type": "host:ytdlp-check" | "host:ytdlp-download" | "host:ytdlp-cancel",
   "ytdlpPath": "E:\\yt-dlp\\yt-dlp.exe",
-  "url": "https://...",
+  "url": "https://...",       // original URL (key for progress/cancel)
+  "downloadUrl": "https://...", // for downloads: alternative URL for yt-dlp (e.g., discovered master playlist), optional
   "formatId": "...",      // for downloads
   "outputPath": "...",    // for downloads
   "filename": "..."       // for downloads
@@ -126,6 +131,7 @@ All messages between extension and native host follow this structure:
   "type": "ytdlp-check-result" | "ytdlp-download-progress" | "ytdlp-download-complete",
   "ok": true,
   "url": "https://...",
+  "downloadUrl": "https://...", // for check result: master playlist URL if discovered, null otherwise
   "success": true,
   "resolution": "1920x1080",    // or "1920x1080 (?)" when guessed, or "unknown"
   "filesize": "1.68GiB",        // null when unknown
@@ -156,6 +162,7 @@ All messages between extension and native host follow this structure:
       resolution: "1920x1080",       // or "1920x1080 (?)" when guessed from URL
       filesize: "1.68GiB",           // null when unknown, updated from download progress
       unknownFilesize: false,         // true when filesize was not available at check time
+      downloadUrl: "https://...",     // master playlist URL if discovered, null otherwise; passed to yt-dlp for download
       checkedAt: "2025-10-25T..."
     }
   }]
@@ -174,6 +181,8 @@ All messages between extension and native host follow this structure:
   }
   ```
 
+- `interruptedDownloads` - Map of downloads whose process died (host restart) or failed; same shape as `activeDownloads` plus `interruptedAt`. Filename is preserved so a resumed download continues from yt-dlp's `.part`/`.ytdl` files.
+
 - `ytdlpSettings` - User configuration:
   ```javascript
   {
@@ -186,12 +195,13 @@ All messages between extension and native host follow this structure:
 
 The native host uses yt-dlp (youtube-dl fork) for video downloading.
 
-**Format Selection Algorithm** (`native-host/index.js:275`):
+**Format Selection Algorithm** (`parseYtDlpOutput()` in `native-host/index.js`):
 - Parses `yt-dlp --list-formats` output
 - Selects highest resolution format by pixel count
 - Extracts format ID, resolution, and file size
 - Falls back to formats with unknown resolution (common for HLS)
-- Guesses resolution from URL patterns (e.g., `1080p` → `1920x1080 (?)`)
+- When resolution is unknown, tries master playlist discovery (`findMasterPlaylist()`) — probing sibling `playlist.m3u8`/`master.m3u8`/`index.m3u8`/`manifest.m3u8` names with the same query string — and re-checks against the master, selecting the specific variant the checked URL points to (via `targetResolution` parameter of `parseYtDlpOutput()`)
+- Guesses resolution from URL patterns (e.g., `1080p` → `1920x1080 (?)`) as a last resort
 
 **Download Progress Parsing** (`native-host/index.js`):
 - Monitors stdout/stderr for `[download] XX.X%` patterns
