@@ -105,6 +105,7 @@ function connect() {
           interruptedDownloads[msg.url] = {
             ...downloadData,
             interruptedAt: new Date().toISOString(),
+            lastError: msg.error,
           };
           console.log(
             "[Background] Saved failed download as interrupted:",
@@ -235,13 +236,30 @@ function extractM3u8Url(fullUrl) {
   return { isM3u8: false };
 }
 
-// Отслеживание .m3u8 запросов
+// Расширения прогрессивных видеофайлов (прямые ссылки, не HLS)
+const MEDIA_FILE_EXTENSIONS = /\.(mp4|m4v|webm|mov|mkv)$/i;
+
+// Отслеживание видеозапросов: HLS-плейлисты (.m3u8) и прямые видеофайлы
 chrome.webRequest.onBeforeRequest.addListener(
   async (details) => {
     const url = details.url;
     const extracted = extractM3u8Url(url);
 
+    // details.type === 'media' — запросы от <video>/<audio> элементов:
+    // так ловим прогрессивные MP4 без мусора (превью, реклама грузятся иначе)
+    let mediaKind = null;
     if (extracted.isM3u8) {
+      mediaKind = "hls";
+    } else if (details.type === "media") {
+      const withoutQuery = url.split("?")[0];
+      if (MEDIA_FILE_EXTENSIONS.test(withoutQuery)) {
+        mediaKind = "file";
+        extracted.effectiveUrl = url;
+        extracted.urlWithoutQuery = withoutQuery;
+      }
+    }
+
+    if (mediaKind) {
       const tabId = details.tabId;
 
       // Получаем URL страницы из вкладки
@@ -264,6 +282,7 @@ chrome.webRequest.onBeforeRequest.addListener(
             url: url,
             effectiveUrl: extracted.effectiveUrl,
             urlWithoutQuery: extracted.urlWithoutQuery,
+            mediaKind: mediaKind,
             timestamp: new Date().toISOString(),
             tabId: tabId,
             pageUrl: pageUrl,

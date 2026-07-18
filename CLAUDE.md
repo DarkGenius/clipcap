@@ -31,7 +31,8 @@ The extension communicates with the native host using Chrome's Native Messaging 
 **Extension Background Service Worker** (`extension/background.js:1`)
 - Maintains persistent connection to native host via `chrome.runtime.connectNative()`
 - Intercepts `.m3u8` requests using `chrome.webRequest` API
-- Detects both direct `.m3u8` URLs and proxy/wrapped URLs (e.g., `m3u8.gammacdn.com/?u=...`) via `extractM3u8Url()` (line 181)
+- Detects both direct `.m3u8` URLs and proxy/wrapped URLs (e.g., `m3u8.gammacdn.com/?u=...`) via `extractM3u8Url()`
+- Also detects **progressive video files** (mp4/m4v/webm/mov/mkv): requests with `details.type === 'media'` (issued by `<video>`/`<audio>` elements, so previews/ads don't match) whose path ends with a known video extension; stored with `mediaKind: 'file'` vs `'hls'`
 - Stores intercepted URLs in `chrome.storage.local` with page context, including `effectiveUrl` for display
 - Forwards messages between popup and native host
 - Manages download progress state in storage for persistence across popup sessions
@@ -58,6 +59,9 @@ The extension communicates with the native host using Chrome's Native Messaging 
 - Parses yt-dlp output to extract best quality format via `parseYtDlpOutput()`
 - **Master playlist discovery** via `findMasterPlaylist()`: when the checked URL is an HLS media playlist (single variant, no resolution info — e.g., `video_2.m3u8`), probes sibling filenames (`playlist.m3u8`, `master.m3u8`, `index.m3u8`, `manifest.m3u8`) with the same query string. If a master playlist (`#EXT-X-STREAM-INF`) is found, matches the checked filename against variant URIs in the master (`findVariantResolution()`) to determine which resolution THIS URL corresponds to, re-runs the check on the master, and selects exactly that variant's format (each `video_N.m3u8` reports its own resolution/size, not the best one). The master URL is returned as `downloadUrl` in the check result; the extension passes it back in `host:ytdlp-download`, while progress/cancel remain keyed by the original `url`. If the variant can't be matched, the master is not used.
 - Falls back to URL-based resolution guessing via `guessResolutionFromUrl()` when yt-dlp reports "unknown" and no master playlist is found
+- For direct video files (non-.m3u8 URLs) with no filesize from yt-dlp, gets the exact size via HEAD request Content-Length (`fetchContentLength()`)
+- For direct mp4/m4v/mov files with unknown resolution, downloads the first (or last) 3MB via Range request and parses the `tkhd` MP4 box to get the exact video track resolution (`probeMp4Resolution()`)
+- `parseYtDlpOutput()` accepts non-numeric format IDs (direct files get e.g. `mp4` as format ID from yt-dlp's generic extractor)
 
 ## Development Commands
 
@@ -153,6 +157,7 @@ All messages between extension and native host follow this structure:
     url: "https://...",               // original URL (used as storage key)
     effectiveUrl: "https://...",      // extracted inner URL for proxy URLs (used for display)
     urlWithoutQuery: "https://...without?params",
+    mediaKind: "hls" | "file",        // HLS playlist or progressive video file
     timestamp: "2025-10-25T...",
     tabId: 123,
     pageUrl: "https://page-url.com",
@@ -175,13 +180,14 @@ All messages between extension and native host follow this structure:
       formatId: "6864",
       resolution: "1920x1080",
       filename: "video_1080_1730123456.mp4",
+      downloadUrl: "https://...",     // URL the download was actually started with (master playlist or null); resume MUST reuse it — its formatId is only valid against this URL
       percent: 45.0,
       startedAt: "2025-10-25T..."
     }
   }
   ```
 
-- `interruptedDownloads` - Map of downloads whose process died (host restart) or failed; same shape as `activeDownloads` plus `interruptedAt`. Filename is preserved so a resumed download continues from yt-dlp's `.part`/`.ytdl` files.
+- `interruptedDownloads` - Map of downloads whose process died (host restart) or failed; same shape as `activeDownloads` plus `interruptedAt` and `lastError` (shown on the card). Filename is preserved so a resumed download continues from yt-dlp's `.part`/`.ytdl` files. When starting a download, popup.js matches interrupted entries both by exact URL and by URL-without-query (same video re-detected with a fresh token) — but only adopts the old filename if the resolution matches (fragments of different variants must not be mixed).
 
 - `ytdlpSettings` - User configuration:
   ```javascript

@@ -5,6 +5,7 @@ A powerful Chrome browser extension for downloading streaming videos, with prima
 ## Features
 
 - Automatic detection of m3u8 video streams on web pages
+- Detection of progressive video files (mp4/webm/mov/mkv) played by `<video>` elements, with exact filesize (HEAD request) and exact resolution (parsed from the MP4 `tkhd` box via Range request)
 - Support for proxy/wrapped m3u8 URLs (e.g., `m3u8.gammacdn.com/?u=...`)
 - Master playlist discovery: when a page only exposes HLS media playlists (e.g., `video_2.m3u8` with no resolution info), the sibling master playlist (`playlist.m3u8`, `master.m3u8`, ...) is located automatically, and each media playlist URL reports the exact resolution and size of its own variant
 - Resolution guessing from URL patterns when yt-dlp reports unknown (common for HLS)

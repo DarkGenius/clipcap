@@ -111,6 +111,30 @@ async function handleMessage(msg) {
           }
         }
 
+        // Для прямых видеофайлов (не .m3u8) уточняем размер и разрешение сами
+        let pathname = '';
+        try {
+          pathname = new URL(url).pathname;
+        } catch (e) {}
+        if (result.success && pathname && !pathname.endsWith('.m3u8')) {
+          let contentLength = null;
+          if (!result.filesize) {
+            contentLength = await fetchContentLength(url);
+            if (contentLength) {
+              result.filesize = formatBytes(contentLength);
+              await log(`Filesize from Content-Length: ${result.filesize}`);
+            }
+          }
+          // Разрешение неизвестно или угадано — парсим tkhd из самого файла (точно)
+          if (/\.(mp4|m4v|mov)$/i.test(pathname) && !/^\d+x\d+$/.test(result.resolution || '')) {
+            const probed = await probeMp4Resolution(url, contentLength);
+            if (probed) {
+              result.resolution = probed;
+              await log(`Resolution from mp4 tkhd box: ${probed}`);
+            }
+          }
+        }
+
         const response = {
           ok: true,
           kind: 'ytdlp-check',
@@ -313,6 +337,97 @@ async function handleMessage(msg) {
   }
 }
 
+// Форматируем байты в стиле yt-dlp (1.27GiB, 490.71MiB)
+function formatBytes(bytes) {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex++;
+  }
+  return `${value.toFixed(2)}${units[unitIndex]}`;
+}
+
+// Точный размер файла по Content-Length (HEAD-запрос) — для прямых видеофайлов
+async function fetchContentLength(url, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
+    if (!res.ok) return null;
+    const length = parseInt(res.headers.get('content-length'), 10);
+    return Number.isFinite(length) && length > 0 ? length : null;
+  } catch (err) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Скачиваем диапазон байтов файла (Range-запрос)
+async function fetchRange(url, start, end, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: { Range: `bytes=${start}-${end}` },
+      signal: controller.signal
+    });
+    if (!res.ok) return null;
+    return Buffer.from(await res.arrayBuffer());
+  } catch (err) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Ищем в буфере MP4-box 'tkhd' (track header) и читаем из него width/height.
+// У аудиодорожек размеры нулевые, поэтому берем первую ненулевую пару
+function parseTkhdResolution(buf) {
+  let idx = 0;
+  while ((idx = buf.indexOf('tkhd', idx)) !== -1) {
+    const boxStart = idx - 4; // 'tkhd' находится по смещению 4 от начала box (после size)
+    if (boxStart < 0) {
+      idx += 4;
+      continue;
+    }
+    const version = buf[boxStart + 8];
+    // v0: width по смещению 84 от начала box, v1 (64-битные времена): 96
+    const widthOffset = boxStart + (version === 1 ? 96 : 84);
+    if (widthOffset + 8 <= buf.length) {
+      // width/height хранятся как fixed-point 16.16
+      const width = buf.readUInt32BE(widthOffset) >>> 16;
+      const height = buf.readUInt32BE(widthOffset + 4) >>> 16;
+      if (width > 0 && height > 0 && width <= 8192 && height <= 8192) {
+        return `${width}x${height}`;
+      }
+    }
+    idx += 4;
+  }
+  return null;
+}
+
+// Определяем разрешение прямого MP4-файла: качаем начало файла (там moov
+// у web-оптимизированных файлов) и парсим tkhd; если не нашли — пробуем хвост
+async function probeMp4Resolution(url, contentLength) {
+  const CHUNK = 3 * 1024 * 1024;
+  const head = await fetchRange(url, 0, CHUNK - 1);
+  if (head) {
+    const resolution = parseTkhdResolution(head);
+    if (resolution) return resolution;
+  }
+  if (contentLength && contentLength > CHUNK) {
+    const tail = await fetchRange(url, contentLength - CHUNK, contentLength - 1);
+    if (tail) {
+      const resolution = parseTkhdResolution(tail);
+      if (resolution) return resolution;
+    }
+  }
+  return null;
+}
+
 // Типичные имена мастер-плейлистов HLS
 const MASTER_PLAYLIST_NAMES = ['playlist.m3u8', 'master.m3u8', 'index.m3u8', 'manifest.m3u8'];
 
@@ -428,11 +543,14 @@ async function parseYtDlpOutput(output, url, targetResolution) {
   await log(`Parsing yt-dlp output, total lines: ${lines.length}${targetResolution ? `, target resolution: ${targetResolution}` : ''}`);
 
   for (const line of lines) {
-    // Ищем ID формата в начале строки (первое число)
-    const formatIdMatch = line.match(/^(\d+)\s+/);
+    // Ищем ID формата в начале строки: обычно число, но для прямых файлов
+    // yt-dlp дает нечисловые ID (например, "mp4")
+    const formatIdMatch = line.match(/^([A-Za-z0-9._-]+)\s+/);
     if (!formatIdMatch) continue;
 
     const formatId = formatIdMatch[1];
+    // Пропускаем строку заголовка таблицы ("ID EXT RESOLUTION ...")
+    if (formatId === 'ID') continue;
 
     const resMatch = line.match(resolutionRegex);
     if (resMatch) {

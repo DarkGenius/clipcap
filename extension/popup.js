@@ -395,7 +395,7 @@ async function loadM3u8Urls() {
   m3u8CountEl.textContent = urls.length;
 
   if (urls.length === 0) {
-    m3u8ListEl.innerHTML = '<div class="empty-state">На этой странице не найдено .m3u8 запросов</div>';
+    m3u8ListEl.innerHTML = '<div class="empty-state">На этой странице не найдено видеозапросов (.m3u8 или прямых видеофайлов)</div>';
   } else {
     m3u8ListEl.innerHTML = urls
       .reverse() // Последние сверху
@@ -422,10 +422,12 @@ async function loadM3u8Urls() {
 
         const unknownFilesize = item.checkResult?.unknownFilesize ? 'true' : 'false';
 
+        const kindBadge = item.mediaKind === 'file' ? ' • Файл' : '';
+
         return `
           <div class="m3u8-item" data-index="${index}" data-url="${escapeHtml(item.url)}" data-unknown-filesize="${unknownFilesize}">
             <div class="url">${escapeHtml(displayUrl(effectiveUrl))}</div>
-            <div class="time">${timeStr}</div>
+            <div class="time">${timeStr}${kindBadge}</div>
             <button class="check-btn" data-url="${escapeHtml(item.url)}">${btnText}</button>
             ${downloadBtn}
             <div class="info-container">${infoHtml}</div>
@@ -737,18 +739,42 @@ async function downloadM3u8(url, formatId, resolution, btnElement, downloadUrl) 
     const settings = await loadSettings();
 
     // Если для этого URL есть прерванная загрузка — используем то же имя файла,
-    // чтобы yt-dlp продолжил с места обрыва, а не начал заново
+    // чтобы yt-dlp продолжил с места обрыва, а не начал заново.
+    // Ищем и по полному URL, и по URL без query: тот же файл мог быть
+    // переобнаружен с новым токеном в query-параметрах
     const interrupted = await getInterruptedDownloads();
-    const interruptedData = interrupted[url];
+    let interruptedKey = interrupted[url] ? url : null;
+    if (!interruptedKey) {
+      const bareUrl = stripQueryParams(url);
+      interruptedKey = Object.keys(interrupted).find(key => stripQueryParams(key) === bareUrl) || null;
+    }
+    let interruptedData = interruptedKey ? interrupted[interruptedKey] : null;
+    // Подхватываем .part только если это тот же вариант качества:
+    // фрагменты разных разрешений смешивать нельзя
+    if (interruptedData?.resolution && resolution && interruptedData.resolution !== resolution) {
+      log(`Прерванная запись пропущена: разрешение ${interruptedData.resolution} != ${resolution}`);
+      interruptedKey = null;
+      interruptedData = null;
+    }
     let filename;
     if (interruptedData?.filename) {
       filename = interruptedData.filename;
       log(`Возобновление прерванной загрузки: ${filename} (с ${(interruptedData.percent || 0).toFixed(1)}%)`);
     } else {
-      // Генерируем имя файла
-      const resolutionShort = resolution.includes('x') ? resolution.split('x')[1].replace(/\D+$/g, '') : resolution.replace(/\D+$/g, ''); // Берем только высоту (например, 1080 из 1920x1080)
       const timestamp = Date.now();
-      filename = `video_${resolutionShort}_${timestamp}.mp4`;
+      // Для прямого видеофайла берем исходное имя из URL
+      let srcName = '';
+      try {
+        srcName = new URL(url).pathname.split('/').pop() || '';
+      } catch (e) {}
+      const fileMatch = srcName.match(/^(.+)\.(mp4|m4v|webm|mov|mkv)$/i);
+      if (fileMatch) {
+        filename = `${fileMatch[1]}_${timestamp}.${fileMatch[2]}`;
+      } else {
+        // Генерируем имя файла
+        const resolutionShort = resolution.includes('x') ? resolution.split('x')[1].replace(/\D+$/g, '') : resolution.replace(/\D+$/g, ''); // Берем только высоту (например, 1080 из 1920x1080)
+        filename = `video_${resolutionShort}_${timestamp}.mp4`;
+      }
     }
 
     // Показываем индикатор загрузки с кнопкой отмены
@@ -786,15 +812,17 @@ async function downloadM3u8(url, formatId, resolution, btnElement, downloadUrl) 
     }
 
     // Загрузка стартовала — убираем запись из прерванных (если была)
-    if (interruptedData) {
-      await removeInterruptedDownload(url);
+    if (interruptedKey) {
+      await removeInterruptedDownload(interruptedKey);
     }
 
-    // Сохраняем активную загрузку в storage
+    // Сохраняем активную загрузку в storage (downloadUrl — чтобы возобновление
+    // использовало тот же URL, с которым согласован formatId)
     await saveActiveDownload(url, {
       formatId,
       resolution,
       filename,
+      downloadUrl: downloadUrl || null,
       percent: interruptedData?.percent || 0
     });
 
@@ -889,11 +917,16 @@ async function loadDownloads() {
       const shortUrl = shownUrl.length > 80 ? shownUrl.substring(0, 80) + '...' : shownUrl;
       const percent = data.percent || 0;
 
+      const lastErrorHtml = data.lastError
+        ? `<div class="last-error">⚠ ${escapeHtml(data.lastError)}</div>`
+        : '';
+
       return `
         <div class="download-item interrupted" data-url="${escapeHtml(url)}" data-index="${index}">
           <button class="remove-btn interrupted-remove-btn" data-url="${escapeHtml(url)}" title="Удалить из списка">×</button>
           <div class="url" title="${escapeHtml(shownUrl)}">${escapeHtml(shortUrl)}</div>
           <div class="filename">⏸ ${escapeHtml(data.filename || 'video.mp4')} • ${data.resolution || 'неизвестно'} • остановлена на ${percent.toFixed(1)}%</div>
+          ${lastErrorHtml}
           <div class="completed-actions">
             <button class="resume-btn" data-url="${escapeHtml(url)}">Продолжить</button>
           </div>
@@ -993,10 +1026,18 @@ async function resumeDownload(url, btn) {
     await ensureConnect();
     const settings = await loadSettings();
 
-    // Достаем downloadUrl из результата проверки (для мастер-плейлистов)
-    const storageResult = await chrome.storage.local.get(['m3u8Urls']);
-    const urlItem = (storageResult.m3u8Urls || []).find(item => item.url === url);
-    const downloadUrl = urlItem?.checkResult?.downloadUrl || undefined;
+    // Используем downloadUrl из самой записи загрузки — он согласован с ее formatId.
+    // Брать downloadUrl из свежего checkResult нельзя: formatId старой загрузки
+    // может не существовать в мастер-плейлисте
+    let downloadUrl = data.downloadUrl || undefined;
+    if (!downloadUrl && data.formatId && data.formatId !== '0') {
+      // Легаси-запись без downloadUrl: ненулевой formatId у m3u8-ссылок мог быть
+      // получен только из мастер-плейлиста — восстанавливаем его из checkResult
+      // (мастер-URL детерминирован: та же директория и query, что у исходного URL)
+      const storageResult = await chrome.storage.local.get(['m3u8Urls']);
+      const urlItem = (storageResult.m3u8Urls || []).find(item => item.url === url);
+      downloadUrl = urlItem?.checkResult?.downloadUrl || undefined;
+    }
 
     const sendResult = await chrome.runtime.sendMessage({
       type: 'host:ytdlp-download',
@@ -1018,6 +1059,7 @@ async function resumeDownload(url, btn) {
       formatId: data.formatId,
       resolution: data.resolution,
       filename: data.filename,
+      downloadUrl: data.downloadUrl || null,
       percent: data.percent || 0
     });
 
