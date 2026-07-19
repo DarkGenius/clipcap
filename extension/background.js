@@ -7,6 +7,24 @@ const ACTIVE_DOWNLOADS_KEY = "activeDownloads";
 const COMPLETED_DOWNLOADS_KEY = "completedDownloads";
 // Ключ для хранения прерванных загрузок
 const INTERRUPTED_DOWNLOADS_KEY = "interruptedDownloads";
+// Ключ для персистентного лога событий, отображаемого на вкладке "Логи" в popup
+const UI_LOGS_KEY = "uiLogs";
+const UI_LOGS_MAX = 300;
+
+// Запись в лог сериализована: события могут приходить пачкой,
+// а chrome.storage не защищает от гонок read-modify-write
+let uiLogWriteChain = Promise.resolve();
+function appendUiLog(text) {
+  uiLogWriteChain = uiLogWriteChain.then(async () => {
+    const result = await chrome.storage.local.get([UI_LOGS_KEY]);
+    const logs = result[UI_LOGS_KEY] || [];
+    const lastSeq = logs.length ? logs[logs.length - 1].seq || 0 : 0;
+    logs.push({ seq: lastSeq + 1, time: new Date().toISOString(), text });
+    if (logs.length > UI_LOGS_MAX) logs.splice(0, logs.length - UI_LOGS_MAX);
+    await chrome.storage.local.set({ [UI_LOGS_KEY]: logs });
+  });
+  return uiLogWriteChain;
+}
 
 function connect() {
   if (port) return;
@@ -21,6 +39,9 @@ function connect() {
       await chrome.storage.local.set({
         [`ytdlp-result-${msg.url}`]: msg,
       });
+      if (msg.success === false && msg.error) {
+        appendUiLog(`Проверка не удалась: ${msg.url} — ${msg.error}`);
+      }
     }
 
     // Сохраняем результат запроса статуса загрузок в storage
@@ -82,6 +103,16 @@ function connect() {
       const activeDownloads = result[ACTIVE_DOWNLOADS_KEY] || {};
       const completedDownloads = result[COMPLETED_DOWNLOADS_KEY] || {};
       const interruptedDownloads = result[INTERRUPTED_DOWNLOADS_KEY] || {};
+
+      // Пишем событие в персистентный лог (попап обычно закрыт в этот момент)
+      const logName = activeDownloads[msg.url]?.filename || msg.url;
+      if (msg.success) {
+        appendUiLog(`Загрузка завершена: ${msg.filepath}`);
+      } else if (msg.error === "Загрузка отменена") {
+        appendUiLog(`Загрузка отменена: ${logName}`);
+      } else {
+        appendUiLog(`Ошибка загрузки ${logName}: ${msg.error || "неизвестная ошибка"}`);
+      }
 
       // Если загрузка была активной
       if (activeDownloads[msg.url]) {
@@ -146,6 +177,9 @@ function connect() {
     console.log("[Background] Native host disconnected");
     if (chrome.runtime.lastError) {
       console.error("[Background] Disconnect error:", chrome.runtime.lastError);
+      appendUiLog(
+        `Нативный хост отключился: ${chrome.runtime.lastError.message || "неизвестная ошибка"}`
+      );
     }
     port = null;
   });

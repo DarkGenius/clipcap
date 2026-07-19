@@ -51,7 +51,7 @@ The extension communicates with the native host using Chrome's Native Messaging 
 - Reads 4-byte length header + JSON message from stdin
 - Handles message types:
   - `host:ytdlp-check` - Runs `yt-dlp --list-formats` and parses output
-  - `host:ytdlp-download` - Spawns `yt-dlp` with progress monitoring
+  - `host:ytdlp-download` - Spawns `yt-dlp` with progress monitoring; remembers the last `ERROR:` line from yt-dlp output (stdout or stderr) and includes it in the `error` field of `ytdlp-download-complete` on failure (e.g. "ERROR: unable to write data: [Errno 28] No space left on device (код: 1)"), instead of just the exit code
   - `host:ytdlp-cancel` - Kills active download process (on Windows uses `taskkill /T /F` to kill the whole process tree, since yt-dlp.exe is a PyInstaller bundle that spawns a child process)
   - `host:ytdlp-status` - Returns `activeUrls` list of downloads running in THIS host instance; used by the popup to detect stale downloads after a host restart (extension reload kills the host and its yt-dlp children)
 - Maintains `downloadProcesses` Map for cancellation support and `cancelledDownloads` Set to report cancellation correctly on close
@@ -188,6 +188,8 @@ All messages between extension and native host follow this structure:
   ```
 
 - `interruptedDownloads` - Map of downloads whose process died (host restart) or failed; same shape as `activeDownloads` plus `interruptedAt` and `lastError` (shown on the card). Filename is preserved so a resumed download continues from yt-dlp's `.part`/`.ytdl` files. When starting a download, popup.js matches interrupted entries both by exact URL and by URL-without-query (same video re-detected with a fresh token) — but only adopts the old filename if the resolution matches (fragments of different variants must not be mixed).
+
+- `uiLogs` - Persistent event log shown on the popup's Logs tab (written ONLY by background.js to avoid read-modify-write races; writes are serialized through a promise chain). Capped at 300 entries. Each entry: `{ seq, time, text }` — `seq` is monotonically increasing so the popup can append only new entries on `chrome.storage.onChanged` (index-based tracking would break when the cap splices old entries). Logged events: download completed/failed/cancelled, check failures, native host disconnects. The Clear button in the popup clears this key too.
 
 - `ytdlpSettings` - User configuration:
   ```javascript

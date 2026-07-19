@@ -54,6 +54,38 @@ function log(msg) {
   logEl.textContent += (typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2)) + '\n';
 }
 
+// Персистентный лог событий, который пишет background.js (ошибки yt-dlp,
+// завершения загрузок и т.п.) — доступен даже если попап был закрыт
+const UI_LOGS_KEY = 'uiLogs';
+let lastUiLogSeq = 0;
+
+function formatUiLogEntry(entry) {
+  const t = new Date(entry.time);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `[${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}] ${entry.text}`;
+}
+
+async function loadUiLogs() {
+  const result = await chrome.storage.local.get([UI_LOGS_KEY]);
+  const logs = result[UI_LOGS_KEY] || [];
+  for (const entry of logs) {
+    log(formatUiLogEntry(entry));
+  }
+  lastUiLogSeq = logs.length ? logs[logs.length - 1].seq || 0 : 0;
+}
+
+// Живое обновление: background дописывает события в storage, попап их дорисовывает
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes[UI_LOGS_KEY]) return;
+  const logs = changes[UI_LOGS_KEY].newValue || [];
+  for (const entry of logs) {
+    if ((entry.seq || 0) > lastUiLogSeq) {
+      log(formatUiLogEntry(entry));
+      lastUiLogSeq = entry.seq || 0;
+    }
+  }
+});
+
 async function ensureConnect() {
   await chrome.runtime.sendMessage({ type: 'ensure-connect' });
 }
@@ -1207,7 +1239,9 @@ btnSaveSettings.addEventListener('click', async () => {
     closeSettings();
   }, 1500);
 });
-btnClearLog.addEventListener('click', () => {
+btnClearLog.addEventListener('click', async () => {
+  await chrome.storage.local.remove(UI_LOGS_KEY);
+  lastUiLogSeq = 0;
   logEl.textContent = '';
   log('Логи очищены');
 });
@@ -1225,6 +1259,7 @@ initTabs();
 
 // Загружаем настройки и список при открытии popup
 (async () => {
+  await loadUiLogs(); // Сначала история событий из storage, затем сессионные сообщения
   await loadSettings();
   await loadM3u8Urls();
   await loadDownloads(); // Загружаем счетчик активных загрузок

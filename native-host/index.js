@@ -180,6 +180,9 @@ async function handleMessage(msg) {
         // Используем spawn для получения потокового вывода
         const child = spawn(ytdlpPath, args);
 
+        // Последняя строка ERROR: из вывода yt-dlp — передаётся расширению при сбое
+        let lastErrorLine = null;
+
         // Сохраняем процесс для возможности отмены
         downloadProcesses.set(url, child);
 
@@ -188,6 +191,9 @@ async function handleMessage(msg) {
           // Убираем управляющие символы (например, \r) которые могут мешать парсингу
           const cleanOutput = output.replace(/\r/g, '\n').trim();
           log(`YT-DLP stdout: ${cleanOutput}`);
+
+          const errMatches = cleanOutput.match(/ERROR:.*$/gm);
+          if (errMatches) lastErrorLine = errMatches[errMatches.length - 1].trim();
 
           // Парсим прогресс из вывода yt-dlp
           // Пример: [download]  45.0% of 1.68GiB at 5.21MiB/s ETA 02:35
@@ -213,6 +219,9 @@ async function handleMessage(msg) {
           // Убираем управляющие символы (например, \r) которые могут мешать парсингу
           const cleanOutput = output.replace(/\r/g, '\n').trim();
           log(`YT-DLP stderr: ${cleanOutput}`);
+
+          const errMatches = cleanOutput.match(/ERROR:.*$/gm);
+          if (errMatches) lastErrorLine = errMatches[errMatches.length - 1].trim();
 
           // yt-dlp может выводить прогресс в stderr
           const progressMatch = cleanOutput.match(/\[download\]\s+([\d.]+)%/);
@@ -256,7 +265,9 @@ async function handleMessage(msg) {
               type: 'ytdlp-download-complete',
               url: url,
               success: false,
-              error: `Ошибка загрузки (код: ${code})`
+              error: lastErrorLine
+                ? `${lastErrorLine} (код: ${code})`
+                : `Ошибка загрузки (код: ${code})`
             });
           }
         });
