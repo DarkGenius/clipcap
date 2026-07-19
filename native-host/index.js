@@ -420,8 +420,28 @@ function parseTkhdResolution(buf) {
   return null;
 }
 
+// Ищем box 'moov' обходом боксов верхнего уровня (ftyp/free/mdat/moov/...):
+// на каждый бокс — один 16-байтовый Range-запрос заголовка (size + type)
+async function findMoovBox(url, total) {
+  let offset = 0;
+  for (let i = 0; i < 16 && offset + 16 <= total; i++) {
+    const hdr = await fetchRange(url, offset, offset + 15);
+    if (!hdr || hdr.length < 16) return null;
+    let size = hdr.readUInt32BE(0);
+    const type = hdr.toString('latin1', 4, 8);
+    if (size === 1) size = Number(hdr.readBigUInt64BE(8)); // 64-битный largesize
+    else if (size === 0) size = total - offset; // box до конца файла
+    if (!/^[\x20-\x7e]{4}$/.test(type) || size < 8) return null; // не MP4-структура
+    if (type === 'moov') return { offset, size };
+    offset += size;
+  }
+  return null;
+}
+
 // Определяем разрешение прямого MP4-файла: качаем начало файла (там moov
-// у web-оптимизированных файлов) и парсим tkhd; если не нашли — пробуем хвост
+// у web-оптимизированных файлов) и парсим tkhd; если не нашли — находим moov
+// обходом боксов и качаем его с начала (tkhd видеодорожки лежит близко к началу
+// moov; хвостовое окно фиксированного размера может его не захватить)
 async function probeMp4Resolution(url, contentLength) {
   const CHUNK = 3 * 1024 * 1024;
   const head = await fetchRange(url, 0, CHUNK - 1);
@@ -429,12 +449,22 @@ async function probeMp4Resolution(url, contentLength) {
     const resolution = parseTkhdResolution(head);
     if (resolution) return resolution;
   }
-  if (contentLength && contentLength > CHUNK) {
-    const tail = await fetchRange(url, contentLength - CHUNK, contentLength - 1);
-    if (tail) {
-      const resolution = parseTkhdResolution(tail);
+  if (!contentLength) contentLength = await fetchContentLength(url);
+  if (!contentLength || contentLength <= CHUNK) return null;
+  const moov = await findMoovBox(url, contentLength);
+  if (moov) {
+    const MOOV_CAP = 16 * 1024 * 1024;
+    const buf = await fetchRange(url, moov.offset, moov.offset + Math.min(moov.size, MOOV_CAP) - 1);
+    if (buf) {
+      const resolution = parseTkhdResolution(buf);
       if (resolution) return resolution;
     }
+  }
+  // Фолбэк на случай нестандартной структуры: просто хвост файла
+  const tail = await fetchRange(url, contentLength - CHUNK, contentLength - 1);
+  if (tail) {
+    const resolution = parseTkhdResolution(tail);
+    if (resolution) return resolution;
   }
   return null;
 }
