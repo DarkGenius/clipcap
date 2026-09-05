@@ -106,6 +106,7 @@ async function saveCheckResult(url, result) {
           resolution: result.resolution,
           filesize: result.filesize || null,
           unknownFilesize: !result.filesize,
+          duration: result.duration || null,
           downloadUrl: result.downloadUrl || null,
           error: result.error,
           checkedAt: new Date().toISOString()
@@ -135,9 +136,9 @@ chrome.runtime.onMessage.addListener(async (msg) => {
   if (msg?.source === 'native-host') {
     // Обработка ответа от yt-dlp проверки
     if (msg.payload?.type === 'ytdlp-check-result') {
-      const { url, success, formatId, resolution, filesize, downloadUrl, error } = msg.payload;
+      const { url, success, formatId, resolution, filesize, duration, downloadUrl, error } = msg.payload;
 
-      const result = { success, formatId, resolution, filesize, downloadUrl, error };
+      const result = { success, formatId, resolution, filesize, duration, downloadUrl, error };
 
       // Сохраняем результат в storage
       await saveCheckResult(url, result);
@@ -157,7 +158,7 @@ chrome.runtime.onMessage.addListener(async (msg) => {
         btn.textContent = 'Перепроверить';
 
         if (success && resolution) {
-          container.innerHTML = `<div class="info success">Разрешение: ${resolution}, Размер: ${filesize || 'неизвестен'}</div>`;
+          container.innerHTML = `<div class="info success">${formatCheckInfo({ resolution, duration, filesize })}</div>`;
           // Обновляем флаг unknownFilesize на родительском элементе
           const m3u8Item = btn.closest('.m3u8-item');
           if (m3u8Item) m3u8Item.dataset.unknownFilesize = filesize ? 'false' : 'true';
@@ -444,7 +445,7 @@ async function loadM3u8Urls() {
         if (item.checkResult) {
           btnText = 'Перепроверить';
           if (item.checkResult.success && item.checkResult.resolution) {
-            infoHtml = `<div class="info success">Разрешение: ${item.checkResult.resolution}, Размер: ${item.checkResult.filesize || 'неизвестен'}</div>`;
+            infoHtml = `<div class="info success">${formatCheckInfo(item.checkResult)}</div>`;
             // Добавляем кнопку скачать если проверка успешна
             downloadBtn = `<button class="download-btn" data-url="${escapeHtml(item.url)}" data-formatid="${item.checkResult.formatId || ''}" data-resolution="${item.checkResult.resolution}" data-download-url="${escapeHtml(item.checkResult.downloadUrl || '')}">Скачать</button>`;
           } else {
@@ -565,7 +566,7 @@ async function checkM3u8Url(url, btnElement) {
 
     // Обновляем UI
     if (result.success && result.resolution) {
-      container.innerHTML = `<div class="info success">Разрешение: ${result.resolution}, Размер: ${result.filesize || 'неизвестен'}</div>`;
+      container.innerHTML = `<div class="info success">${formatCheckInfo(result)}</div>`;
       // Обновляем флаг unknownFilesize на родительском элементе
       const m3u8Item = btnElement.closest('.m3u8-item');
       if (m3u8Item) m3u8Item.dataset.unknownFilesize = result.filesize ? 'false' : 'true';
@@ -895,6 +896,24 @@ function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text;
   return div.innerHTML;
+}
+
+// Строка с разрешением, длительностью и размером — длительность отличает
+// полный ролик от трейлера, когда в списке несколько похожих ссылок
+function formatCheckInfo(checkResult) {
+  const parts = [`Разрешение: ${checkResult.resolution}`];
+  if (checkResult.duration) parts.push(`Длительность: ${formatDuration(checkResult.duration)}`);
+  parts.push(`Размер: ${checkResult.filesize || 'неизвестен'}`);
+  return parts.join(', ');
+}
+
+function formatDuration(seconds) {
+  const total = Math.round(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
 // Функция для отображения активных загрузок

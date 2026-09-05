@@ -88,35 +88,77 @@ async function handleMessage(msg) {
         let result = await parseYtDlpOutput(stdout, url);
         await log(`Parse result: success=${result.success}, resolution=${result.resolution}, filesize=${result.filesize}`);
 
-        // Если разрешение не определено точно (unknown или угадано по URL),
-        // пробуем найти мастер-плейлист рядом с медиа-плейлистом
         let downloadUrl = null;
-        if (result.success && !/^\d+x\d+$/.test(result.resolution || '')) {
-          const master = await findMasterPlaylist(url);
-          // Используем мастер только если удалось определить, какому варианту
-          // соответствует проверяемый URL — иначе показывали бы чужое разрешение
-          if (master && master.variantResolution) {
-            await log(`Re-checking with master playlist: ${master.masterUrl} (variant: ${master.variantResolution})`);
-            try {
-              const { stdout: masterStdout } = await execFileAsync(ytdlpPath, ['--list-formats', master.masterUrl], { timeout: 30000 });
-              const masterResult = await parseYtDlpOutput(masterStdout, master.masterUrl, master.variantResolution);
-              if (masterResult.success && masterResult.resolution === master.variantResolution) {
-                result = masterResult;
-                downloadUrl = master.masterUrl;
-                await log(`Master playlist result: resolution=${result.resolution}, filesize=${result.filesize}, formatId=${result.formatId}`);
-              }
-            } catch (masterErr) {
-              await log(`Master playlist check failed: ${masterErr.message || String(masterErr)}`);
-            }
-          }
-        }
-
-        // Для прямых видеофайлов (не .m3u8) уточняем размер и разрешение сами
         let pathname = '';
         try {
           pathname = new URL(url).pathname;
         } catch (e) {}
-        if (result.success && pathname && !pathname.endsWith('.m3u8')) {
+        const isHls = pathname.endsWith('.m3u8');
+
+        if (result.success && isHls) {
+          const content = await fetchText(url);
+          const isMaster = !!(content && content.includes('#EXT-X-STREAM-INF'));
+          let masterUrl = isMaster ? url : null;
+          let masterContent = isMaster ? content : null;
+
+          // Мастер-плейлист рядом с медиа-плейлистом уточняет разрешение
+          // и даёт BANDWIDTH варианта для оценки размера
+          if (!isMaster && content) {
+            const needMaster = !/^\d+x\d+$/.test(result.resolution || '') || !result.filesize;
+            const master = needMaster ? await findMasterPlaylist(url, content) : null;
+            if (master) {
+              masterUrl = master.masterUrl;
+              masterContent = master.content;
+              // Уточняем разрешение по мастеру только если удалось определить, какому
+              // варианту соответствует проверяемый URL — иначе показывали бы чужое
+              if (!/^\d+x\d+$/.test(result.resolution || '') && master.variantResolution) {
+                await log(`Re-checking with master playlist: ${master.masterUrl} (variant: ${master.variantResolution})`);
+                try {
+                  const { stdout: masterStdout } = await execFileAsync(ytdlpPath, ['--list-formats', master.masterUrl], { timeout: 30000 });
+                  const masterResult = await parseYtDlpOutput(masterStdout, master.masterUrl, master.variantResolution);
+                  if (masterResult.success && masterResult.resolution === master.variantResolution) {
+                    result = masterResult;
+                    downloadUrl = master.masterUrl;
+                    await log(`Master playlist result: resolution=${result.resolution}, filesize=${result.filesize}, formatId=${result.formatId}`);
+                  }
+                } catch (masterErr) {
+                  await log(`Master playlist check failed: ${masterErr.message || String(masterErr)}`);
+                }
+              }
+            }
+          }
+
+          // Длительность (и оценка размера, если yt-dlp его не дал) считаем по самому
+          // плейлисту: для ряда CDN (например, Cloudflare Stream) yt-dlp не сообщает ни то, ни другое
+          const meta = await getHlsMeta(url, content, masterUrl, masterContent, result.resolution);
+          if (meta && meta.duration) {
+            result.duration = Math.round(meta.duration);
+            await log(`HLS duration: ${result.duration}s (${formatDuration(result.duration)})`);
+            if (!result.filesize && meta.bandwidth) {
+              result.filesize = '~' + formatBytes(meta.bandwidth * meta.duration / 8);
+              await log(`Filesize estimated from bandwidth ${meta.bandwidth}: ${result.filesize}`);
+            }
+          }
+        }
+
+        // DASH-манифест: длительность и битрейт берём из самого MPD —
+        // yt-dlp для ряда CDN (Cloudflare Stream) не сообщает ни того, ни другого
+        if (result.success && pathname.endsWith('.mpd')) {
+          const meta = await getDashMeta(url, result.resolution);
+          if (meta && meta.duration) {
+            result.duration = Math.round(meta.duration);
+            await log(`DASH duration: ${result.duration}s (${formatDuration(result.duration)})`);
+            if (!result.filesize && meta.bandwidth) {
+              result.filesize = '~' + formatBytes(meta.bandwidth * meta.duration / 8);
+              await log(`Filesize estimated from bandwidth ${meta.bandwidth}: ${result.filesize}`);
+            }
+          }
+        }
+
+        // Для прямых видеофайлов уточняем размер и разрешение сами.
+        // Проверяем расширение явно: манифесты (.mpd) сюда попадать не должны,
+        // иначе Content-Length манифеста уехал бы в размер видео
+        if (result.success && MEDIA_FILE_EXTENSIONS.test(pathname)) {
           let contentLength = null;
           if (!result.filesize) {
             contentLength = await fetchContentLength(url);
@@ -145,6 +187,7 @@ async function handleMessage(msg) {
           formatId: result.formatId,
           resolution: result.resolution,
           filesize: result.filesize,
+          duration: result.duration || null,
           error: result.error
         };
         await log(`Sending response: ${JSON.stringify(response)}`);
@@ -470,7 +513,11 @@ async function probeMp4Resolution(url, contentLength) {
 }
 
 // Типичные имена мастер-плейлистов HLS
-const MASTER_PLAYLIST_NAMES = ['playlist.m3u8', 'master.m3u8', 'index.m3u8', 'manifest.m3u8'];
+// video.m3u8 — имя мастер-плейлиста у Cloudflare Stream
+const MASTER_PLAYLIST_NAMES = ['video.m3u8', 'playlist.m3u8', 'master.m3u8', 'index.m3u8', 'manifest.m3u8'];
+
+// Прогрессивные видеофайлы — только для них имеет смысл HEAD/tkhd-зондирование
+const MEDIA_FILE_EXTENSIONS = /\.(mp4|m4v|webm|mov|mkv)$/i;
 
 async function fetchText(url, timeoutMs = 10000) {
   const controller = new AbortController();
@@ -511,7 +558,7 @@ function findVariantResolution(masterContent, mediaFilename) {
 // пробуем найти мастер-плейлист в той же директории с теми же query-параметрами.
 // Возвращает { masterUrl, variantResolution } — разрешение именно того варианта,
 // на который указывает исходный URL (или null, если вариант не найден в мастере)
-async function findMasterPlaylist(url) {
+async function findMasterPlaylist(url, prefetchedContent) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -521,7 +568,7 @@ async function findMasterPlaylist(url) {
   const filename = parsed.pathname.split('/').pop();
   if (!filename || !filename.endsWith('.m3u8')) return null;
 
-  const content = await fetchText(url);
+  const content = prefetchedContent !== undefined ? prefetchedContent : await fetchText(url);
   if (!content || !content.trimStart().startsWith('#EXTM3U')) return null;
   if (content.includes('#EXT-X-STREAM-INF')) {
     // Это уже мастер-плейлист
@@ -539,11 +586,157 @@ async function findMasterPlaylist(url) {
     if (candidateContent && candidateContent.trimStart().startsWith('#EXTM3U') && candidateContent.includes('#EXT-X-STREAM-INF')) {
       const variantResolution = findVariantResolution(candidateContent, filename);
       await log(`Master playlist found: ${candidateUrl}, variant ${filename} resolution: ${variantResolution}`);
-      return { masterUrl: candidateUrl, variantResolution };
+      return { masterUrl: candidateUrl, content: candidateContent, variantResolution };
     }
   }
   await log('Master playlist not found');
   return null;
+}
+
+// Суммарная длительность VOD-медиаплейлиста в секундах (сумма #EXTINF)
+function parseHlsDuration(content) {
+  let total = 0;
+  let found = false;
+  for (const line of content.split('\n')) {
+    const m = line.match(/^\s*#EXTINF:\s*([\d.]+)/);
+    if (m) {
+      total += parseFloat(m[1]);
+      found = true;
+    }
+  }
+  return found ? total : null;
+}
+
+// Варианты мастер-плейлиста: разрешение, битрейт и URI
+function parseMasterVariants(content) {
+  const lines = content.split('\n').map(l => l.trim());
+  const variants = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+    for (let j = i + 1; j < lines.length; j++) {
+      const uriLine = lines[j];
+      if (!uriLine) continue;
+      if (uriLine.startsWith('#')) break;
+      const resMatch = lines[i].match(/RESOLUTION=(\d+x\d+)/);
+      // AVERAGE-BANDWIDTH точнее для оценки размера, BANDWIDTH — пиковый
+      const bwMatch = lines[i].match(/AVERAGE-BANDWIDTH=(\d+)/) || lines[i].match(/(?:^|[,:])BANDWIDTH=(\d+)/);
+      const resolution = resMatch ? resMatch[1] : null;
+      const [width, height] = resolution ? resolution.split('x').map(Number) : [0, 0];
+      variants.push({
+        uri: uriLine,
+        resolution,
+        pixels: width * height,
+        bandwidth: bwMatch ? parseInt(bwMatch[1]) : null
+      });
+      break;
+    }
+  }
+  return variants;
+}
+
+// Длительность HLS (из медиа-плейлиста) и битрейт варианта (из мастер-плейлиста).
+// Нужно потому, что для части CDN yt-dlp не сообщает ни длительность, ни размер
+async function getHlsMeta(url, content, masterUrl, masterContent, targetResolution) {
+  let variant = null;
+  if (masterContent) {
+    const variants = parseMasterVariants(masterContent);
+    variant = variants.find(v => v.resolution === targetResolution)
+      || variants.slice().sort((a, b) => b.pixels - a.pixels)[0]
+      || null;
+  }
+
+  // Если проверяемый URL — сам мастер, длительность меряем по его варианту
+  let mediaContent = content;
+  if (masterUrl === url) {
+    mediaContent = variant ? await fetchText(new URL(variant.uri, url).toString()) : null;
+  }
+
+  return {
+    duration: mediaContent ? parseHlsDuration(mediaContent) : null,
+    bandwidth: variant ? variant.bandwidth : null
+  };
+}
+
+// Длительность ISO 8601 из MPD: PT1H25M30.5S
+function parseIso8601Duration(value) {
+  const m = value.match(/^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/);
+  if (!m) return null;
+  const [, d, h, min, s] = m;
+  const total = (parseFloat(d || 0) * 86400) + (parseFloat(h || 0) * 3600) + (parseFloat(min || 0) * 60) + parseFloat(s || 0);
+  return total > 0 ? total : null;
+}
+
+// Длительность и битрейт нужного представления из DASH-манифеста
+async function getDashMeta(url, targetResolution) {
+  const xml = await fetchText(url);
+  if (!xml || !xml.includes('<MPD')) return null;
+
+  const durMatch = xml.match(/mediaPresentationDuration="([^"]+)"/);
+  const duration = durMatch ? parseIso8601Duration(durMatch[1]) : null;
+
+  // Representation с width/height — видеодорожки; аудио идёт отдельно,
+  // поэтому к битрейту видео добавляем лучшую аудиодорожку
+  const reps = [];
+  for (const tag of xml.match(/<Representation\b[^>]*>/g) || []) {
+    const bwMatch = tag.match(/\bbandwidth="(\d+)"/);
+    if (!bwMatch) continue;
+    const wMatch = tag.match(/\bwidth="(\d+)"/);
+    const hMatch = tag.match(/\bheight="(\d+)"/);
+    reps.push({
+      bandwidth: parseInt(bwMatch[1]),
+      resolution: wMatch && hMatch ? `${wMatch[1]}x${hMatch[1]}` : null,
+      pixels: wMatch && hMatch ? parseInt(wMatch[1]) * parseInt(hMatch[1]) : 0
+    });
+  }
+
+  const videoReps = reps.filter(r => r.resolution);
+  const video = videoReps.find(r => r.resolution === targetResolution)
+    || videoReps.slice().sort((a, b) => b.pixels - a.pixels)[0]
+    || null;
+  const audioBandwidths = reps.filter(r => !r.resolution).map(r => r.bandwidth);
+  const audio = audioBandwidths.length ? Math.max(...audioBandwidths) : 0;
+
+  // @bandwidth в MPD — пиковый, оценка по нему завышена в полтора раза.
+  // Рядом обычно лежит HLS-мастер (Cloudflare Stream отдаёт оба) с
+  // AVERAGE-BANDWIDTH — он даёт оценку с точностью до пары процентов
+  const hlsBandwidth = await findSiblingHlsBandwidth(url, targetResolution);
+  const bandwidth = hlsBandwidth || (video ? video.bandwidth + audio : null);
+
+  return { duration, bandwidth };
+}
+
+// Средний битрейт нужного варианта из HLS-мастера, лежащего рядом с манифестом
+async function findSiblingHlsBandwidth(url, targetResolution) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (e) {
+    return null;
+  }
+  const dirPath = parsed.pathname.slice(0, parsed.pathname.lastIndexOf('/') + 1);
+  for (const name of MASTER_PLAYLIST_NAMES) {
+    const candidate = new URL(url);
+    candidate.pathname = dirPath + name;
+    const content = await fetchText(candidate.toString());
+    if (!content || !content.includes('#EXT-X-STREAM-INF')) continue;
+    const variants = parseMasterVariants(content);
+    const variant = variants.find(v => v.resolution === targetResolution)
+      || variants.slice().sort((a, b) => b.pixels - a.pixels)[0];
+    if (variant && variant.bandwidth) {
+      await log(`Bandwidth from sibling HLS master ${candidate.toString()}: ${variant.bandwidth}`);
+      return variant.bandwidth;
+    }
+  }
+  return null;
+}
+
+function formatDuration(seconds) {
+  const total = Math.round(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
 // Пытаемся угадать разрешение по паттерну в URL (например, "1080p", "720p")
@@ -577,6 +770,7 @@ async function parseYtDlpOutput(output, url, targetResolution) {
   let bestFormatId = null;
   let bestResolution = null;
   let bestFilesize = null;
+  let bestVideoOnly = false;
   let maxPixels = 0;
   let fallbackFormatId = null;
   let targetMatched = false;
@@ -606,15 +800,20 @@ async function parseYtDlpOutput(output, url, targetResolution) {
 
       // Если задано целевое разрешение (конкретный вариант из мастер-плейлиста) —
       // выбираем именно его, иначе максимальное по пикселям
+      // Формат без звука (аудио отдельной дорожкой) — колонка ACODEC = "video only"
+      const videoOnly = /\bvideo only\b/i.test(line);
+
       if (targetResolution && resolution === targetResolution && !targetMatched) {
         targetMatched = true;
         bestFormatId = formatId;
         bestResolution = resolution;
+        bestVideoOnly = videoOnly;
         bestFilesize = sizeMatch ? sizeMatch[0].trim().replace(/\s+/g, '') : null;
       } else if (!targetMatched && pixels > maxPixels) {
         maxPixels = pixels;
         bestFormatId = formatId;
         bestResolution = resolution;
+        bestVideoOnly = videoOnly;
         bestFilesize = sizeMatch ? sizeMatch[0].trim().replace(/\s+/g, '') : null;
       }
     } else {
@@ -627,10 +826,13 @@ async function parseYtDlpOutput(output, url, targetResolution) {
   }
 
   if (bestResolution) {
-    await log(`Best format selected: id=${bestFormatId}, resolution=${bestResolution}, filesize=${bestFilesize}`);
+    // У формата нет звука — просим yt-dlp домешать лучшую аудиодорожку
+    // (запасной вариант после "/" — на случай, если аудио у видео вовсе нет)
+    const selector = bestVideoOnly ? `${bestFormatId}+bestaudio/${bestFormatId}` : bestFormatId;
+    await log(`Best format selected: id=${selector}, resolution=${bestResolution}, filesize=${bestFilesize}, videoOnly=${bestVideoOnly}`);
     return {
       success: true,
-      formatId: bestFormatId,
+      formatId: selector,
       resolution: bestResolution,
       filesize: bestFilesize || null
     };

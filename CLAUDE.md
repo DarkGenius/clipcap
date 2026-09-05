@@ -33,6 +33,8 @@ The extension communicates with the native host using Chrome's Native Messaging 
 - Intercepts `.m3u8` requests using `chrome.webRequest` API
 - Detects both direct `.m3u8` URLs and proxy/wrapped URLs (e.g., `m3u8.gammacdn.com/?u=...`) via `extractM3u8Url()`
 - Also detects **progressive video files** (mp4/m4v/webm/mov/mkv): requests with `details.type === 'media'` (issued by `<video>`/`<audio>` elements, so previews/ads don't match) whose path ends with a known video extension; stored with `mediaKind: 'file'` vs `'hls'`
+- **HLS/DASH segments are filtered out** (`isMediaSegment()`): `init.mp4`, `seg_3.mp4`, `chunk-1.m4s` also arrive as `type === 'media'`, but they are fragments of a playlist that is already in the list — downloading one alone is meaningless and yt-dlp errors out on it. Matched by filename against `MEDIA_SEGMENT_NAME` (`init|seg|segment|chunk|frag|fragment` + optional separator + optional digits + extension), so ordinary names like `initial-cut.mp4` still pass
+- **DASH manifests** (`.mpd`) are detected like `.m3u8`, regardless of request type, and stored with `mediaKind: 'dash'`. Chrome players often choose DASH over HLS, so without this the video may not be found at all
 - Stores intercepted URLs in `chrome.storage.local` with page context, including `effectiveUrl` for display
 - Forwards messages between popup and native host
 - Manages download progress state in storage for persistence across popup sessions
@@ -57,8 +59,11 @@ The extension communicates with the native host using Chrome's Native Messaging 
 - Maintains `downloadProcesses` Map for cancellation support and `cancelledDownloads` Set to report cancellation correctly on close
 - Logs to `host.log` for debugging
 - Parses yt-dlp output to extract best quality format via `parseYtDlpOutput()`
-- **Master playlist discovery** via `findMasterPlaylist()`: when the checked URL is an HLS media playlist (single variant, no resolution info — e.g., `video_2.m3u8`), probes sibling filenames (`playlist.m3u8`, `master.m3u8`, `index.m3u8`, `manifest.m3u8`) with the same query string. If a master playlist (`#EXT-X-STREAM-INF`) is found, matches the checked filename against variant URIs in the master (`findVariantResolution()`) to determine which resolution THIS URL corresponds to, re-runs the check on the master, and selects exactly that variant's format (each `video_N.m3u8` reports its own resolution/size, not the best one). The master URL is returned as `downloadUrl` in the check result; the extension passes it back in `host:ytdlp-download`, while progress/cancel remain keyed by the original `url`. If the variant can't be matched, the master is not used.
+- **Master playlist discovery** via `findMasterPlaylist()`: when the checked URL is an HLS media playlist (single variant, no resolution info — e.g., `video_2.m3u8`), probes sibling filenames (`video.m3u8` — Cloudflare Stream, `playlist.m3u8`, `master.m3u8`, `index.m3u8`, `manifest.m3u8`) with the same query string. If a master playlist (`#EXT-X-STREAM-INF`) is found, matches the checked filename against variant URIs in the master (`findVariantResolution()`) to determine which resolution THIS URL corresponds to, re-runs the check on the master, and selects exactly that variant's format (each `video_N.m3u8` reports its own resolution/size, not the best one). The master URL is returned as `downloadUrl` in the check result; the extension passes it back in `host:ytdlp-download`, while progress/cancel remain keyed by the original `url`. If the variant can't be matched, the master is not used.
 - Falls back to URL-based resolution guessing via `guessResolutionFromUrl()` when yt-dlp reports "unknown" and no master playlist is found
+- **HLS duration and size estimation** (`getHlsMeta()`): for some CDNs (notably Cloudflare Stream) yt-dlp reports neither duration nor filesize, so the host computes duration itself by summing `#EXTINF` values in the media playlist (`parseHlsDuration()`) and estimates size as `AVERAGE-BANDWIDTH × duration / 8` using the matching variant from the master playlist (`parseMasterVariants()`). The estimate lands within ~1-2% of the real file. Because of this, the master playlist is now probed whenever resolution OR filesize is unknown (previously only on unknown resolution); the playlist body fetched for that probe is reused, so there is no extra request. `duration` (seconds) is returned in the check result and shown in the popup — it is what distinguishes a full video from a trailer when several similar URLs are detected
+- **DASH duration and size estimation** (`getDashMeta()`): parses `mediaPresentationDuration` (ISO 8601) and `<Representation>` `bandwidth`/`width`/`height` from the MPD. Since `@bandwidth` in DASH is the peak rate (overestimates size by ~50%), it first looks for a sibling HLS master in the same directory (`findSiblingHlsBandwidth()`) and prefers its `AVERAGE-BANDWIDTH`, falling back to the MPD value
+- The HEAD/tkhd probing below is gated on `MEDIA_FILE_EXTENSIONS` rather than "not .m3u8" — otherwise a `.mpd` manifest's own Content-Length would be reported as the video size
 - For direct video files (non-.m3u8 URLs) with no filesize from yt-dlp, gets the exact size via HEAD request Content-Length (`fetchContentLength()`)
 - For direct mp4/m4v/mov files with unknown resolution, parses the `tkhd` MP4 box to get the exact video track resolution (`probeMp4Resolution()`): first tries the head 3MB (faststart files), then locates the `moov` box by walking top-level boxes (`findMoovBox()`, one 16-byte Range request per box header) and downloads the moov from its start (capped at 16MB) — a fixed-size tail window is NOT enough, since moov can exceed it and then only the audio track's zero-size `tkhd` lands in the window. Fetches Content-Length itself when the caller didn't (yt-dlp may have already reported a filesize, skipping the HEAD)
 - `parseYtDlpOutput()` accepts non-numeric format IDs (direct files get e.g. `mp4` as format ID from yt-dlp's generic extractor)
@@ -138,7 +143,8 @@ All messages between extension and native host follow this structure:
   "downloadUrl": "https://...", // for check result: master playlist URL if discovered, null otherwise
   "success": true,
   "resolution": "1920x1080",    // or "1920x1080 (?)" when guessed, or "unknown"
-  "filesize": "1.68GiB",        // null when unknown
+  "filesize": "1.68GiB",        // null when unknown; "~61.41MiB" when estimated from HLS bandwidth
+  "duration": 154,              // seconds, from the HLS playlist; null when unknown
   "formatId": "6864",
   "percent": 45.0,              // for progress
   "filesize": "1.49GiB",        // for progress (estimated, from yt-dlp output)
@@ -157,7 +163,7 @@ All messages between extension and native host follow this structure:
     url: "https://...",               // original URL (used as storage key)
     effectiveUrl: "https://...",      // extracted inner URL for proxy URLs (used for display)
     urlWithoutQuery: "https://...without?params",
-    mediaKind: "hls" | "file",        // HLS playlist or progressive video file
+    mediaKind: "hls" | "dash" | "file", // HLS playlist, DASH manifest or progressive video file
     timestamp: "2025-10-25T...",
     tabId: 123,
     pageUrl: "https://page-url.com",
@@ -167,6 +173,7 @@ All messages between extension and native host follow this structure:
       resolution: "1920x1080",       // or "1920x1080 (?)" when guessed from URL
       filesize: "1.68GiB",           // null when unknown, updated from download progress
       unknownFilesize: false,         // true when filesize was not available at check time
+      duration: 154,                  // seconds, from the HLS playlist; null when unknown
       downloadUrl: "https://...",     // master playlist URL if discovered, null otherwise; passed to yt-dlp for download
       checkedAt: "2025-10-25T..."
     }
@@ -210,6 +217,7 @@ The native host uses yt-dlp (youtube-dl fork) for video downloading.
 - Falls back to formats with unknown resolution (common for HLS)
 - When resolution is unknown, tries master playlist discovery (`findMasterPlaylist()`) — probing sibling `playlist.m3u8`/`master.m3u8`/`index.m3u8`/`manifest.m3u8` names with the same query string — and re-checks against the master, selecting the specific variant the checked URL points to (via `targetResolution` parameter of `parseYtDlpOutput()`)
 - Guesses resolution from URL patterns (e.g., `1080p` → `1920x1080 (?)`) as a last resort
+- **Video-only formats**: when the selected format line shows `video only` in the ACODEC column (audio is a separate track — always the case on Cloudflare Stream), the returned format ID becomes `<id>+bestaudio/<id>` so yt-dlp muxes in the best audio track. Without this the download is silent. **Requires ffmpeg on PATH** for the merge step
 
 **Download Progress Parsing** (`native-host/index.js`):
 - Monitors stdout/stderr for `[download] XX.X%` patterns

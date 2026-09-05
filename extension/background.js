@@ -273,6 +273,16 @@ function extractM3u8Url(fullUrl) {
 // Расширения прогрессивных видеофайлов (прямые ссылки, не HLS)
 const MEDIA_FILE_EXTENSIONS = /\.(mp4|m4v|webm|mov|mkv)$/i;
 
+// Сегменты HLS/DASH: init.mp4, seg_3.mp4, chunk-1.m4s. Приходят как type 'media',
+// но это куски уже найденного плейлиста — по отдельности качать их бессмысленно,
+// а yt-dlp на них падает ("Ошибка выполнения yt-dlp" на .../audio/130/seg_3.mp4)
+const MEDIA_SEGMENT_NAME = /^(?:init|seg|segment|chunk|frag|fragment)[-_]?\d*\.[a-z0-9]+$/i;
+
+function isMediaSegment(urlWithoutQuery) {
+  const filename = urlWithoutQuery.split("/").pop() || "";
+  return MEDIA_SEGMENT_NAME.test(filename);
+}
+
 // Отслеживание видеозапросов: HLS-плейлисты (.m3u8) и прямые видеофайлы
 chrome.webRequest.onBeforeRequest.addListener(
   async (details) => {
@@ -284,9 +294,19 @@ chrome.webRequest.onBeforeRequest.addListener(
     let mediaKind = null;
     if (extracted.isM3u8) {
       mediaKind = "hls";
-    } else if (details.type === "media") {
+    } else {
       const withoutQuery = url.split("?")[0];
-      if (MEDIA_FILE_EXTENSIONS.test(withoutQuery)) {
+      if (withoutQuery.endsWith(".mpd")) {
+        // DASH-манифест: Cloudflare Stream и другие CDN отдают его наравне с m3u8,
+        // и плеер в Chrome нередко берёт именно его — без этого видео не находится
+        mediaKind = "dash";
+        extracted.effectiveUrl = url;
+        extracted.urlWithoutQuery = withoutQuery;
+      } else if (
+        details.type === "media" &&
+        MEDIA_FILE_EXTENSIONS.test(withoutQuery) &&
+        !isMediaSegment(withoutQuery)
+      ) {
         mediaKind = "file";
         extracted.effectiveUrl = url;
         extracted.urlWithoutQuery = withoutQuery;
