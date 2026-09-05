@@ -9,6 +9,7 @@ package-lock.json
 *.log
 logs/
 native-host/host.log
+native-host/host.log.*
 
 # OS generated files
 # Windows

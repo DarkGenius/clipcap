@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readdir, appendFile } from 'node:fs/promises';
+import { readdir, appendFile, rename, stat, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -10,6 +10,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const logFile = join(__dirname, 'host.log');
 
+// Ротация: в лог уходит каждая строка вывода yt-dlp, и без ограничения
+// host.log дорастал до сотен мегабайт
+const MAX_LOG_SIZE = 5 * 1024 * 1024;
+const MAX_LOG_FILES = 3;
+
 const execFileAsync = promisify(execFile);
 
 // Храним активные процессы загрузки
@@ -17,16 +22,44 @@ const downloadProcesses = new Map();
 // URL, для которых была запрошена отмена (чтобы корректно определить причину завершения)
 const cancelledDownloads = new Set();
 
+// null — размер ещё не прочитан с диска (хост живёт между запусками Chrome)
+let logSize = null;
+// Записи идут через цепочку промисов: log() часто зовут без await
+// (обработчики stdout/stderr yt-dlp), а ротация не должна пересечься с записью
+let logChain = Promise.resolve();
+
+// host.log.2 -> host.log.3, host.log.1 -> host.log.2, host.log -> host.log.1
+async function rotateLogs() {
+  await rm(`${logFile}.${MAX_LOG_FILES}`, { force: true });
+  for (let i = MAX_LOG_FILES - 1; i >= 1; i--) {
+    await rename(`${logFile}.${i}`, `${logFile}.${i + 1}`).catch(() => {});
+  }
+  await rename(logFile, `${logFile}.1`);
+  logSize = 0;
+}
+
+async function writeLog(logMessage) {
+  if (logSize === null) {
+    logSize = await stat(logFile).then(s => s.size).catch(() => 0);
+  }
+  if (logSize >= MAX_LOG_SIZE) {
+    await rotateLogs();
+  }
+  await appendFile(logFile, logMessage);
+  logSize += Buffer.byteLength(logMessage);
+}
+
 // Функция логирования
-async function log(message) {
+function log(message) {
   const timestamp = new Date().toISOString();
   const logMessage = `[${timestamp}] ${message}\n`;
-  try {
-    await appendFile(logFile, logMessage);
-    console.error(logMessage.trim()); // Также выводим в stderr для отладки
-  } catch (err) {
-    console.error('Log error:', err);
-  }
+  console.error(logMessage.trim()); // Также выводим в stderr для отладки
+  logChain = logChain
+    .then(() => writeLog(logMessage))
+    .catch((err) => {
+      console.error('Log error:', err);
+    });
+  return logChain;
 }
 
 function readMessage() {

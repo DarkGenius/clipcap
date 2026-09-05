@@ -57,7 +57,7 @@ The extension communicates with the native host using Chrome's Native Messaging 
   - `host:ytdlp-cancel` - Kills active download process (on Windows uses `taskkill /T /F` to kill the whole process tree, since yt-dlp.exe is a PyInstaller bundle that spawns a child process)
   - `host:ytdlp-status` - Returns `activeUrls` list of downloads running in THIS host instance; used by the popup to detect stale downloads after a host restart (extension reload kills the host and its yt-dlp children)
 - Maintains `downloadProcesses` Map for cancellation support and `cancelledDownloads` Set to report cancellation correctly on close
-- Logs to `host.log` for debugging
+- Logs to `host.log` for debugging, with size-based rotation: at 5 MB the file is rotated to `host.log.1` and up to `MAX_LOG_FILES` (3) old files are kept, so the log cannot grow unbounded (every yt-dlp output line is logged; it had reached 308 MB). Writes go through a promise chain because `log()` is often called without `await` from the yt-dlp stdout/stderr handlers, and a rotation must not interleave with an append
 - Parses yt-dlp output to extract best quality format via `parseYtDlpOutput()`
 - **Master playlist discovery** via `findMasterPlaylist()`: when the checked URL is an HLS media playlist (single variant, no resolution info — e.g., `video_2.m3u8`), probes sibling filenames (`video.m3u8` — Cloudflare Stream, `playlist.m3u8`, `master.m3u8`, `index.m3u8`, `manifest.m3u8`) with the same query string. If a master playlist (`#EXT-X-STREAM-INF`) is found, matches the checked filename against variant URIs in the master (`findVariantResolution()`) to determine which resolution THIS URL corresponds to, re-runs the check on the master, and selects exactly that variant's format (each `video_N.m3u8` reports its own resolution/size, not the best one). The master URL is returned as `downloadUrl` in the check result; the extension passes it back in `host:ytdlp-download`, while progress/cancel remain keyed by the original `url`. If the variant can't be matched, the master is not used.
 - Falls back to URL-based resolution guessing via `guessResolutionFromUrl()` when yt-dlp reports "unknown" and no master playlist is found
@@ -100,6 +100,12 @@ Then send test messages via stdin (4-byte little-endian length + JSON):
 
 ```bash
 tail -f native-host/host.log
+```
+
+Rotated files are `native-host/host.log.1` … `host.log.3` (newest first):
+
+```bash
+cat native-host/host.log.1 native-host/host.log
 ```
 
 ## Native Messaging Setup
