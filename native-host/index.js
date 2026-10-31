@@ -122,6 +122,8 @@ async function handleMessage(msg) {
         await log(`Parse result: success=${result.success}, resolution=${result.resolution}, filesize=${result.filesize}`);
 
         let downloadUrl = null;
+        // Битрейт по разрешению — для оценки размера каждого варианта в списке качества
+        let bandwidthFor = null;
         let pathname = '';
         try {
           pathname = new URL(url).pathname;
@@ -164,6 +166,13 @@ async function handleMessage(msg) {
           // Длительность (и оценка размера, если yt-dlp его не дал) считаем по самому
           // плейлисту: для ряда CDN (например, Cloudflare Stream) yt-dlp не сообщает ни то, ни другое
           const meta = await getHlsMeta(url, content, masterUrl, masterContent, result.resolution);
+          if (isMaster) {
+            const variants = parseMasterVariants(content);
+            bandwidthFor = (resolution) => {
+              const v = variants.find(x => x.resolution === resolution && x.bandwidth);
+              return v ? v.bandwidth : null;
+            };
+          }
           if (meta && meta.duration) {
             result.duration = Math.round(meta.duration);
             await log(`HLS duration: ${result.duration}s (${formatDuration(result.duration)})`);
@@ -178,6 +187,7 @@ async function handleMessage(msg) {
         // yt-dlp для ряда CDN (Cloudflare Stream) не сообщает ни того, ни другого
         if (result.success && pathname.endsWith('.mpd')) {
           const meta = await getDashMeta(url, result.resolution);
+          if (meta) bandwidthFor = meta.bandwidthFor;
           if (meta && meta.duration) {
             result.duration = Math.round(meta.duration);
             await log(`DASH duration: ${result.duration}s (${formatDuration(result.duration)})`);
@@ -210,6 +220,21 @@ async function handleMessage(msg) {
           }
         }
 
+        // Список качеств: манифест (DASH или HLS-мастер) содержит все варианты сразу,
+        // и плеер может стримить не лучший — даём выбрать. При перепроверке через
+        // найденный мастер (downloadUrl) URL соответствует одному конкретному варианту,
+        // поэтому список не отдаём
+        let formats = null;
+        if (result.success && !downloadUrl && Array.isArray(result.formats) && result.formats.length > 1) {
+          formats = result.formats.map(f => {
+            if (f.formatId === result.formatId) return { ...f, filesize: result.filesize || f.filesize };
+            if (f.filesize || !result.duration || !bandwidthFor) return f;
+            const bw = bandwidthFor(f.resolution);
+            return bw ? { ...f, filesize: '~' + formatBytes(bw * result.duration / 8) } : f;
+          });
+          await log(`Formats offered: ${formats.map(f => `${f.resolution}=${f.formatId} (${f.filesize || '?'})`).join(', ')}`);
+        }
+
         const response = {
           ok: true,
           kind: 'ytdlp-check',
@@ -221,6 +246,7 @@ async function handleMessage(msg) {
           resolution: result.resolution,
           filesize: result.filesize,
           duration: result.duration || null,
+          formats: formats,
           error: result.error
         };
         await log(`Sending response: ${JSON.stringify(response)}`);
@@ -732,19 +758,29 @@ async function getDashMeta(url, targetResolution) {
   // @bandwidth в MPD — пиковый, оценка по нему завышена в полтора раза.
   // Рядом обычно лежит HLS-мастер (Cloudflare Stream отдаёт оба) с
   // AVERAGE-BANDWIDTH — он даёт оценку с точностью до пары процентов
-  const hlsBandwidth = await findSiblingHlsBandwidth(url, targetResolution);
-  const bandwidth = hlsBandwidth || (video ? video.bandwidth + audio : null);
+  const hlsVariants = await findSiblingHlsVariants(url);
+  const hlsVariant = hlsVariants.find(v => v.resolution === targetResolution && v.bandwidth)
+    || hlsVariants.slice().sort((a, b) => b.pixels - a.pixels).find(v => v.bandwidth);
+  const bandwidth = (hlsVariant && hlsVariant.bandwidth) || (video ? video.bandwidth + audio : null);
 
-  return { duration, bandwidth };
+  // Битрейт для произвольного разрешения — для оценки размера каждого варианта в списке качества
+  const bandwidthFor = (resolution) => {
+    const hls = hlsVariants.find(v => v.resolution === resolution && v.bandwidth);
+    if (hls) return hls.bandwidth;
+    const rep = videoReps.find(r => r.resolution === resolution);
+    return rep ? rep.bandwidth + audio : null;
+  };
+
+  return { duration, bandwidth, bandwidthFor };
 }
 
-// Средний битрейт нужного варианта из HLS-мастера, лежащего рядом с манифестом
-async function findSiblingHlsBandwidth(url, targetResolution) {
+// Варианты HLS-мастера, лежащего рядом с манифестом (пустой список, если его нет)
+async function findSiblingHlsVariants(url) {
   let parsed;
   try {
     parsed = new URL(url);
   } catch (e) {
-    return null;
+    return [];
   }
   const dirPath = parsed.pathname.slice(0, parsed.pathname.lastIndexOf('/') + 1);
   for (const name of MASTER_PLAYLIST_NAMES) {
@@ -753,14 +789,12 @@ async function findSiblingHlsBandwidth(url, targetResolution) {
     const content = await fetchText(candidate.toString());
     if (!content || !content.includes('#EXT-X-STREAM-INF')) continue;
     const variants = parseMasterVariants(content);
-    const variant = variants.find(v => v.resolution === targetResolution)
-      || variants.slice().sort((a, b) => b.pixels - a.pixels)[0];
-    if (variant && variant.bandwidth) {
-      await log(`Bandwidth from sibling HLS master ${candidate.toString()}: ${variant.bandwidth}`);
-      return variant.bandwidth;
+    if (variants.some(v => v.bandwidth)) {
+      await log(`Bandwidth from sibling HLS master ${candidate.toString()}: ${variants.map(v => `${v.resolution}=${v.bandwidth}`).join(', ')}`);
+      return variants;
     }
   }
-  return null;
+  return [];
 }
 
 function formatDuration(seconds) {
@@ -807,6 +841,9 @@ async function parseYtDlpOutput(output, url, targetResolution) {
   let maxPixels = 0;
   let fallbackFormatId = null;
   let targetMatched = false;
+  // Все видеоформаты (по одному на разрешение) — для выбора качества в popup:
+  // один DASH-манифест / HLS-мастер содержит сразу все варианты
+  const formatsByResolution = new Map();
 
   await log(`Parsing yt-dlp output, total lines: ${lines.length}${targetResolution ? `, target resolution: ${targetResolution}` : ''}`);
 
@@ -836,6 +873,16 @@ async function parseYtDlpOutput(output, url, targetResolution) {
       // Формат без звука (аудио отдельной дорожкой) — колонка ACODEC = "video only"
       const videoOnly = /\bvideo only\b/i.test(line);
 
+      // Первый формат с данным разрешением (так же, как при выборе лучшего)
+      if (!formatsByResolution.has(resolution)) {
+        formatsByResolution.set(resolution, {
+          formatId: videoOnly ? `${formatId}+bestaudio/${formatId}` : formatId,
+          resolution,
+          pixels,
+          filesize: sizeMatch ? sizeMatch[0].trim().replace(/\s+/g, '') : null
+        });
+      }
+
       if (targetResolution && resolution === targetResolution && !targetMatched) {
         targetMatched = true;
         bestFormatId = formatId;
@@ -863,11 +910,15 @@ async function parseYtDlpOutput(output, url, targetResolution) {
     // (запасной вариант после "/" — на случай, если аудио у видео вовсе нет)
     const selector = bestVideoOnly ? `${bestFormatId}+bestaudio/${bestFormatId}` : bestFormatId;
     await log(`Best format selected: id=${selector}, resolution=${bestResolution}, filesize=${bestFilesize}, videoOnly=${bestVideoOnly}`);
+    const formats = Array.from(formatsByResolution.values())
+      .sort((a, b) => b.pixels - a.pixels)
+      .map(({ pixels, ...f }) => f);
     return {
       success: true,
       formatId: selector,
       resolution: bestResolution,
-      filesize: bestFilesize || null
+      filesize: bestFilesize || null,
+      formats
     };
   }
 

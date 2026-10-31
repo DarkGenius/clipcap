@@ -108,6 +108,10 @@ async function saveCheckResult(url, result) {
           unknownFilesize: !result.filesize,
           duration: result.duration || null,
           downloadUrl: result.downloadUrl || null,
+          // Все варианты качества (null, если вариант один); selectedFormatId —
+          // выбор пользователя в popup, сбрасывается при перепроверке
+          formats: Array.isArray(result.formats) && result.formats.length > 1 ? result.formats : null,
+          selectedFormatId: null,
           error: result.error,
           checkedAt: new Date().toISOString()
         }
@@ -120,25 +124,105 @@ async function saveCheckResult(url, result) {
   await chrome.storage.local.set({ m3u8Urls: updatedUrls });
 }
 
+// Размер из прогресса загрузки — записываем тому варианту качества, который качается
 async function updateCheckResultFilesize(url, filesize) {
+  const activeDownloads = await getActiveDownloads();
+  const downloadingFormatId = activeDownloads[url]?.formatId;
   const result = await chrome.storage.local.get(['m3u8Urls']);
   const allUrls = result.m3u8Urls || [];
-  for (const item of allUrls) {
-    if (item.url === url && item.checkResult && item.checkResult.unknownFilesize) {
-      item.checkResult.filesize = filesize;
-      await chrome.storage.local.set({ m3u8Urls: allUrls });
-      break;
-    }
+  const item = allUrls.find(i => i.url === url && i.checkResult);
+  if (!item) return;
+  const cr = item.checkResult;
+  let changed = false;
+  const format = cr.formats?.find(f => f.formatId === downloadingFormatId);
+  if (format && !format.filesize) {
+    format.filesize = filesize;
+    changed = true;
   }
+  if (cr.unknownFilesize && (!downloadingFormatId || downloadingFormatId === cr.formatId)) {
+    cr.filesize = filesize;
+    changed = true;
+  }
+  if (changed) await chrome.storage.local.set({ m3u8Urls: allUrls });
+}
+
+// Запоминаем выбранное качество, чтобы оно сохранялось при повторном открытии popup
+async function saveSelectedFormat(url, formatId) {
+  const result = await chrome.storage.local.get(['m3u8Urls']);
+  const allUrls = result.m3u8Urls || [];
+  const item = allUrls.find(i => i.url === url && i.checkResult);
+  if (!item) return;
+  item.checkResult.selectedFormatId = formatId;
+  await chrome.storage.local.set({ m3u8Urls: allUrls });
+}
+
+// Результат успешной проверки в карточке: инфо-строка, выбор качества
+// (если манифест содержит несколько вариантов) и кнопка "Скачать".
+// Параметры загрузки кнопка берет из своих data-атрибутов — их обновляет выбор качества
+function renderCheckSuccess(itemEl, url, result) {
+  if (!itemEl) return;
+  const container = itemEl.querySelector('.info-container');
+  const checkBtn = itemEl.querySelector('.check-btn');
+  const formats = Array.isArray(result.formats) && result.formats.length > 1 ? result.formats : null;
+
+  let downloadBtn = itemEl.querySelector('.download-btn');
+  if (!downloadBtn) {
+    downloadBtn = document.createElement('button');
+    downloadBtn.className = 'download-btn';
+    downloadBtn.textContent = 'Скачать';
+    downloadBtn.addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      await downloadM3u8(url, btn.dataset.formatid, btn.dataset.resolution, btn, btn.dataset.downloadUrl || null);
+    });
+    checkBtn.after(downloadBtn);
+  }
+  downloadBtn.dataset.url = url;
+  downloadBtn.dataset.downloadUrl = result.downloadUrl || '';
+
+  const apply = (fmt) => {
+    container.innerHTML = `<div class="info success">${formatCheckInfo({ resolution: fmt.resolution, duration: result.duration, filesize: fmt.filesize })}</div>`;
+    itemEl.dataset.unknownFilesize = fmt.filesize ? 'false' : 'true';
+    downloadBtn.dataset.formatid = fmt.formatId || '';
+    downloadBtn.dataset.resolution = fmt.resolution;
+  };
+
+  itemEl.querySelector('.format-select')?.remove();
+  const best = { formatId: result.formatId, resolution: result.resolution, filesize: result.filesize };
+  if (!formats) {
+    apply(best);
+    return;
+  }
+
+  const selected = formats.find(f => f.formatId === result.selectedFormatId)
+    || formats.find(f => f.formatId === result.formatId)
+    || formats[0];
+  const select = document.createElement('select');
+  select.className = 'format-select';
+  select.title = 'Качество';
+  formats.forEach((f, i) => {
+    const option = document.createElement('option');
+    option.value = String(i);
+    const height = f.resolution.split('x')[1];
+    option.textContent = `${height}p${f.filesize ? ` · ${f.filesize}` : ''}`;
+    option.selected = f === selected;
+    select.appendChild(option);
+  });
+  select.addEventListener('change', async () => {
+    const fmt = formats[Number(select.value)];
+    apply(fmt);
+    await saveSelectedFormat(url, fmt.formatId);
+  });
+  downloadBtn.before(select);
+  apply(selected);
 }
 
 chrome.runtime.onMessage.addListener(async (msg) => {
   if (msg?.source === 'native-host') {
     // Обработка ответа от yt-dlp проверки
     if (msg.payload?.type === 'ytdlp-check-result') {
-      const { url, success, formatId, resolution, filesize, duration, downloadUrl, error } = msg.payload;
+      const { url, success, formatId, resolution, filesize, duration, downloadUrl, formats, error } = msg.payload;
 
-      const result = { success, formatId, resolution, filesize, duration, downloadUrl, error };
+      const result = { success, formatId, resolution, filesize, duration, downloadUrl, formats, error };
 
       // Сохраняем результат в storage
       await saveCheckResult(url, result);
@@ -158,25 +242,7 @@ chrome.runtime.onMessage.addListener(async (msg) => {
         btn.textContent = 'Перепроверить';
 
         if (success && resolution) {
-          container.innerHTML = `<div class="info success">${formatCheckInfo({ resolution, duration, filesize })}</div>`;
-          // Обновляем флаг unknownFilesize на родительском элементе
-          const m3u8Item = btn.closest('.m3u8-item');
-          if (m3u8Item) m3u8Item.dataset.unknownFilesize = filesize ? 'false' : 'true';
-          // Добавляем кнопку "Скачать" если ее еще нет
-          const existingDownloadBtn = btn.parentElement.querySelector('.download-btn');
-          if (!existingDownloadBtn) {
-            const downloadBtn = document.createElement('button');
-            downloadBtn.className = 'download-btn';
-            downloadBtn.textContent = 'Скачать';
-            downloadBtn.setAttribute('data-url', url);
-            downloadBtn.setAttribute('data-formatid', formatId || '');
-            downloadBtn.setAttribute('data-resolution', resolution);
-            downloadBtn.setAttribute('data-download-url', downloadUrl || '');
-            downloadBtn.addEventListener('click', async (e) => {
-              await downloadM3u8(url, formatId, resolution, e.target, downloadUrl);
-            });
-            btn.parentElement.insertBefore(downloadBtn, btn.nextSibling);
-          }
+          renderCheckSuccess(btn.closest('.m3u8-item'), url, result);
         } else {
           container.innerHTML = `<div class="info error">${error || 'Видеопоток не найден'}</div>`;
         }
@@ -269,6 +335,8 @@ chrome.runtime.onMessage.addListener(async (msg) => {
           // При успешной загрузке скрываем кнопку "Скачать" и показываем статус
           progressContainer.innerHTML = `<div class="info success">✓ Загружено: ${filepath}</div>`;
           downloadBtn.style.display = 'none';
+          const formatSelect = downloadBtn.parentElement.querySelector('.format-select');
+          if (formatSelect) formatSelect.style.display = 'none';
         } else {
           // При ошибке показываем сообщение и разрешаем повторную попытку
           progressContainer.innerHTML = `<div class="info error">${error || 'Ошибка загрузки'}</div>`;
@@ -364,9 +432,11 @@ function restoreDownloadUI(url, downloadData) {
 
   downloadBtn.disabled = true;
 
-  // Скрываем кнопки "Проверить" и "Скачать"
+  // Скрываем кнопки "Проверить", "Скачать" и выбор качества
   const checkBtn = downloadBtn.parentElement.querySelector('.check-btn');
+  const formatSelect = downloadBtn.parentElement.querySelector('.format-select');
   if (checkBtn) checkBtn.style.display = 'none';
+  if (formatSelect) formatSelect.style.display = 'none';
   if (downloadBtn) downloadBtn.style.display = 'none';
 
   // Показываем прогресс-бар с кнопкой отмены
@@ -441,14 +511,10 @@ async function loadM3u8Urls() {
 
         let infoHtml = '';
         let btnText = 'Проверить';
-        let downloadBtn = '';
         if (item.checkResult) {
           btnText = 'Перепроверить';
-          if (item.checkResult.success && item.checkResult.resolution) {
-            infoHtml = `<div class="info success">${formatCheckInfo(item.checkResult)}</div>`;
-            // Добавляем кнопку скачать если проверка успешна
-            downloadBtn = `<button class="download-btn" data-url="${escapeHtml(item.url)}" data-formatid="${item.checkResult.formatId || ''}" data-resolution="${item.checkResult.resolution}" data-download-url="${escapeHtml(item.checkResult.downloadUrl || '')}">Скачать</button>`;
-          } else {
+          // Успешный результат (инфо, выбор качества, "Скачать") дорисовывает renderCheckSuccess ниже
+          if (!item.checkResult.success || !item.checkResult.resolution) {
             infoHtml = `<div class="info error">${item.checkResult.error || 'Видеопоток не найден'}</div>`;
           }
         }
@@ -462,7 +528,6 @@ async function loadM3u8Urls() {
             <div class="url">${escapeHtml(displayUrl(effectiveUrl))}</div>
             <div class="time">${timeStr}${kindBadge}</div>
             <button class="check-btn" data-url="${escapeHtml(item.url)}">${btnText}</button>
-            ${downloadBtn}
             <div class="info-container">${infoHtml}</div>
             <div class="progress-container"></div>
           </div>
@@ -478,16 +543,12 @@ async function loadM3u8Urls() {
       });
     });
 
-    // Добавляем обработчики для кнопок "Скачать"
-    document.querySelectorAll('.download-btn').forEach(btn => {
-      btn.addEventListener('click', async (e) => {
-        const url = e.target.getAttribute('data-url');
-        const formatId = e.target.getAttribute('data-formatid');
-        const resolution = e.target.getAttribute('data-resolution');
-        const downloadUrl = e.target.getAttribute('data-download-url') || null;
-        await downloadM3u8(url, formatId, resolution, e.target, downloadUrl);
-      });
-    });
+    // Инфо, выбор качества и кнопка "Скачать" для уже проверенных URL
+    for (const item of urls) {
+      if (!item.checkResult?.success || !item.checkResult.resolution) continue;
+      const itemEl = m3u8ListEl.querySelector(`.m3u8-item[data-url="${CSS.escape(item.url)}"]`);
+      if (itemEl) renderCheckSuccess(itemEl, item.url, item.checkResult);
+    }
 
     // Восстанавливаем UI для активных загрузок
     for (const [url, downloadData] of Object.entries(activeDownloads)) {
@@ -566,26 +627,7 @@ async function checkM3u8Url(url, btnElement) {
 
     // Обновляем UI
     if (result.success && result.resolution) {
-      container.innerHTML = `<div class="info success">${formatCheckInfo(result)}</div>`;
-      // Обновляем флаг unknownFilesize на родительском элементе
-      const m3u8Item = btnElement.closest('.m3u8-item');
-      if (m3u8Item) m3u8Item.dataset.unknownFilesize = result.filesize ? 'false' : 'true';
-
-      // Добавляем кнопку "Скачать"
-      const existingDownloadBtn = btnElement.parentElement.querySelector('.download-btn');
-      if (!existingDownloadBtn) {
-        const downloadBtn = document.createElement('button');
-        downloadBtn.className = 'download-btn';
-        downloadBtn.textContent = 'Скачать';
-        downloadBtn.setAttribute('data-url', url);
-        downloadBtn.setAttribute('data-formatid', result.formatId || '');
-        downloadBtn.setAttribute('data-resolution', result.resolution);
-        downloadBtn.setAttribute('data-download-url', result.downloadUrl || '');
-        downloadBtn.addEventListener('click', async (e) => {
-          await downloadM3u8(url, result.formatId, result.resolution, e.target, result.downloadUrl);
-        });
-        btnElement.parentElement.insertBefore(downloadBtn, btnElement.nextSibling);
-      }
+      renderCheckSuccess(btnElement.closest('.m3u8-item'), url, result);
     } else {
       container.innerHTML = `<div class="info error">${result.error || 'Видеопоток не найден'}</div>`;
     }
@@ -762,11 +804,13 @@ async function downloadM3u8(url, formatId, resolution, btnElement, downloadUrl) 
   try {
     btnElement.disabled = true;
 
-    // Скрываем кнопки "Проверить" и "Скачать"
+    // Скрываем кнопки "Проверить", "Скачать" и выбор качества
     const checkBtn = btnElement.parentElement.querySelector('.check-btn');
     const downloadBtn = btnElement.parentElement.querySelector('.download-btn');
+    const formatSelect = btnElement.parentElement.querySelector('.format-select');
     if (checkBtn) checkBtn.style.display = 'none';
     if (downloadBtn) downloadBtn.style.display = 'none';
+    if (formatSelect) formatSelect.style.display = 'none';
 
     // Получаем настройки
     const settings = await loadSettings();
