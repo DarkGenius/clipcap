@@ -36,6 +36,7 @@ The extension communicates with the native host using Chrome's Native Messaging 
 - **HLS/DASH segments are filtered out** (`isMediaSegment()`): `init.mp4`, `seg_3.mp4`, `chunk-1.m4s` also arrive as `type === 'media'`, but they are fragments of a playlist that is already in the list — downloading one alone is meaningless and yt-dlp errors out on it. Matched by filename against `MEDIA_SEGMENT_NAME` (`init|seg|segment|chunk|frag|fragment` + optional separator + optional digits + extension), so ordinary names like `initial-cut.mp4` still pass
 - **DASH manifests** (`.mpd`) are detected like `.m3u8`, regardless of request type, and stored with `mediaKind: 'dash'`. Chrome players often choose DASH over HLS, so without this the video may not be found at all
 - Stores intercepted URLs in `chrome.storage.local` with page context, including `effectiveUrl` for display
+- **The `m3u8Urls` list is bounded** (`pruneM3u8Urls()`): entries older than 7 days are dropped and at most `M3U8_URLS_MAX` (1000) newest are kept, on every add and once at service-worker start. Unbounded, it had grown to ~10k entries and hit the 10 MB `chrome.storage.local` quota — after which every `set()` (new URLs, check results, download state) was silently rejected and no videos were found on any page. Writes go through `updateM3u8Urls()`, a promise chain, because a player fires a burst of manifest/track requests and parallel read-modify-write would drop entries; write errors are logged to the service-worker console
 - Forwards messages between popup and native host
 - Manages download progress state in storage for persistence across popup sessions
 
@@ -165,7 +166,7 @@ All messages between extension and native host follow this structure:
 
 **chrome.storage.local keys:**
 
-- `m3u8Urls` - Array of detected m3u8 URLs with metadata:
+- `m3u8Urls` - Array of detected m3u8 URLs with metadata, oldest first, pruned to the last 7 days / 1000 entries (see background.js):
   ```javascript
   [{
     url: "https://...",               // original URL (used as storage key)

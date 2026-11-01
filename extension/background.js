@@ -328,29 +328,69 @@ chrome.webRequest.onBeforeRequest.addListener(
         pageUrl = details.initiator || details.documentUrl || "unknown";
       }
 
-      chrome.storage.local.get(["m3u8Urls"], (result) => {
-        const urls = result.m3u8Urls || [];
-        // Добавляем URL, если его еще нет в списке
-        if (!urls.some((item) => item.url === url)) {
-          urls.push({
-            url: url,
-            effectiveUrl: extracted.effectiveUrl,
-            urlWithoutQuery: extracted.urlWithoutQuery,
-            mediaKind: mediaKind,
-            timestamp: new Date().toISOString(),
-            tabId: tabId,
-            pageUrl: pageUrl,
-          });
-          chrome.storage.local.set({ m3u8Urls: urls });
-          console.log(
-            "[Background] Saved m3u8 URL:",
-            url,
-            "from page:",
-            pageUrl
-          );
-        }
+      addM3u8Url({
+        url: url,
+        effectiveUrl: extracted.effectiveUrl,
+        urlWithoutQuery: extracted.urlWithoutQuery,
+        mediaKind: mediaKind,
+        timestamp: new Date().toISOString(),
+        tabId: tabId,
+        pageUrl: pageUrl,
       });
     }
   },
   { urls: ["<all_urls>"] }
 );
+
+// Список найденных URL ограничен по возрасту и количеству. Без этого он рос
+// бесконечно (каждый пойманный запрос со всех сайтов, ~1 КБ на запись), упёрся
+// в квоту chrome.storage.local (10 МБ) — и после этого любой set() молча
+// отклонялся: новые видео переставали находиться, загрузки — сохраняться
+const M3U8_URLS_KEY = "m3u8Urls";
+const M3U8_URLS_MAX = 1000;
+const M3U8_URLS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Записи добавляются в конец, так что массив упорядочен от старых к новым
+function pruneM3u8Urls(urls) {
+  const cutoff = Date.now() - M3U8_URLS_MAX_AGE_MS;
+  const fresh = urls.filter((item) => !(Date.parse(item.timestamp) < cutoff));
+  return fresh.length > M3U8_URLS_MAX
+    ? fresh.slice(fresh.length - M3U8_URLS_MAX)
+    : fresh;
+}
+
+// Запись сериализована: плеер шлёт пачку запросов (манифест, дорожки) почти
+// одновременно, и параллельные read-modify-write затирали бы друг друга
+let m3u8WriteChain = Promise.resolve();
+function updateM3u8Urls(mutate) {
+  m3u8WriteChain = m3u8WriteChain
+    .then(async () => {
+      const result = await chrome.storage.local.get([M3U8_URLS_KEY]);
+      const urls = result[M3U8_URLS_KEY] || [];
+      const updated = mutate(urls);
+      if (updated) await chrome.storage.local.set({ [M3U8_URLS_KEY]: updated });
+    })
+    .catch((err) => {
+      // Ошибку записи (например, переполнение квоты) нельзя терять молча
+      console.error("[Background] Failed to update m3u8 URLs:", err);
+    });
+  return m3u8WriteChain;
+}
+
+function addM3u8Url(entry) {
+  return updateM3u8Urls((urls) => {
+    if (urls.some((item) => item.url === entry.url)) return null;
+    urls.push(entry);
+    console.log("[Background] Saved m3u8 URL:", entry.url, "from page:", entry.pageUrl);
+    return pruneM3u8Urls(urls);
+  });
+}
+
+// Чистим при каждом старте service worker: сразу освобождает место,
+// если хранилище уже переполнено
+updateM3u8Urls((urls) => {
+  const pruned = pruneM3u8Urls(urls);
+  if (pruned.length === urls.length) return null;
+  console.log(`[Background] Pruned m3u8 URLs: ${urls.length} -> ${pruned.length}`);
+  return pruned;
+});
