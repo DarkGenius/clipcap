@@ -55,7 +55,7 @@ The extension communicates with the native host using Chrome's Native Messaging 
 - Reads 4-byte length header + JSON message from stdin
 - Handles message types:
   - `host:ytdlp-check` - Runs `yt-dlp --list-formats` and parses output
-  - `host:ytdlp-download` - Spawns `yt-dlp` with progress monitoring; remembers the last `ERROR:` line from yt-dlp output (stdout or stderr) and includes it in the `error` field of `ytdlp-download-complete` on failure (e.g. "ERROR: unable to write data: [Errno 28] No space left on device (код: 1)"), instead of just the exit code
+  - `host:ytdlp-download` - Spawns `yt-dlp` with progress monitoring; remembers the last `ERROR:` message from yt-dlp output (stdout or stderr; see Download Progress Parsing) and includes it in the `error` field of `ytdlp-download-complete` on failure (e.g. "ERROR: unable to write data: [Errno 28] No space left on device (код: 1)"), instead of just the exit code
   - `host:ytdlp-cancel` - Kills active download process (on Windows uses `taskkill /T /F` to kill the whole process tree, since yt-dlp.exe is a PyInstaller bundle that spawns a child process)
   - `host:ytdlp-status` - Returns `activeUrls` list of downloads running in THIS host instance; used by the popup to detect stale downloads after a host restart (extension reload kills the host and its yt-dlp children)
 - Maintains `downloadProcesses` Map for cancellation support and `cancelledDownloads` Set to report cancellation correctly on close
@@ -230,9 +230,11 @@ The native host uses yt-dlp (youtube-dl fork) for video downloading.
 - Guesses resolution from URL patterns (e.g., `1080p` → `1920x1080 (?)`) as a last resort
 - **Video-only formats**: when the selected format line shows `video only` in the ACODEC column (audio is a separate track — always the case on Cloudflare Stream), the returned format ID becomes `<id>+bestaudio/<id>` so yt-dlp muxes in the best audio track. Without this the download is silent. **Requires ffmpeg on PATH** for the merge step
 
-**Download Progress Parsing** (`native-host/index.js`):
-- Monitors stdout/stderr for `[download] XX.X%` patterns
-- Extracts estimated filesize from progress output (e.g., `of ~ 1.49GiB`)
+**Download Progress Parsing** (`createDownloadOutputParser()` in `native-host/index.js`, one parser for both stdout and stderr):
+- Monitors stdout/stderr for `[download] XX.X%` patterns, line by line
+- **Multi-stream formats** (`6+bestaudio/6`): yt-dlp downloads the tracks one after another, each with its own 0–100%. Streams are tracked by `[download] Destination: …` / `… has already been downloaded` lines and the reported percent is the size-weighted total (equal weights while a track hasn't started). Before this, a failed video track followed by an already-downloaded audio track (`100% of 35.67MiB`) made the download look stuck at 100%
+- `lastError`: yt-dlp may print `ERROR: ` with the actual message on the NEXT line (`[download] Got error: HTTP Error 503 … Giving up after 10 retries`) — the parser joins them
+- Extracts estimated filesize from progress output (e.g., `of ~ 1.49GiB`); for multi-stream formats the sum of all tracks
 - Sends progress updates with filesize to extension in real-time
 - Handles both regular and fragmented downloads
 

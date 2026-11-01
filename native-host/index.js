@@ -282,64 +282,31 @@ async function handleMessage(msg) {
         // Используем spawn для получения потокового вывода
         const child = spawn(ytdlpPath, args);
 
-        // Последняя строка ERROR: из вывода yt-dlp — передаётся расширению при сбое
-        let lastErrorLine = null;
-
         // Сохраняем процесс для возможности отмены
         downloadProcesses.set(url, child);
 
-        child.stdout.on('data', (data) => {
-          const output = data.toString();
+        // stdout и stderr разбираются одним парсером (прогресс бывает в обоих)
+        const parser = createDownloadOutputParser(formatId);
+
+        const handleOutput = (source, data) => {
           // Убираем управляющие символы (например, \r) которые могут мешать парсингу
-          const cleanOutput = output.replace(/\r/g, '\n').trim();
-          log(`YT-DLP stdout: ${cleanOutput}`);
-
-          const errMatches = cleanOutput.match(/ERROR:.*$/gm);
-          if (errMatches) lastErrorLine = errMatches[errMatches.length - 1].trim();
-
-          // Парсим прогресс из вывода yt-dlp
-          // Пример: [download]  45.0% of 1.68GiB at 5.21MiB/s ETA 02:35
-          // Пример с фрагментами: [download]   8.3% of ~   1.49GiB at    2.92MiB/s ETA 07:55 (frag 39/457)
-          const progressMatch = cleanOutput.match(/\[download\]\s+([\d.]+)%/);
-          if (progressMatch) {
-            const percent = parseFloat(progressMatch[1]);
-            // Извлекаем размер файла из строки прогресса (например, "of ~ 1.49GiB" или "of 1.68GiB")
-            const sizeMatch = cleanOutput.match(/of\s+~?\s*([\d.]+\s*(?:B|KiB|MiB|GiB|TiB))/i);
+          const cleanOutput = data.toString().replace(/\r/g, '\n').trim();
+          log(`YT-DLP ${source}: ${cleanOutput}`);
+          const progress = parser.feed(cleanOutput);
+          if (progress) {
             const msg = {
               type: 'ytdlp-download-progress',
               url: url,
-              percent: percent,
+              percent: progress.percent,
               output: cleanOutput
             };
-            if (sizeMatch) msg.filesize = sizeMatch[1].trim().replace(/\s+/g, '');
+            if (progress.filesize) msg.filesize = progress.filesize;
             writeMessage(msg);
           }
-        });
+        };
 
-        child.stderr.on('data', (data) => {
-          const output = data.toString();
-          // Убираем управляющие символы (например, \r) которые могут мешать парсингу
-          const cleanOutput = output.replace(/\r/g, '\n').trim();
-          log(`YT-DLP stderr: ${cleanOutput}`);
-
-          const errMatches = cleanOutput.match(/ERROR:.*$/gm);
-          if (errMatches) lastErrorLine = errMatches[errMatches.length - 1].trim();
-
-          // yt-dlp может выводить прогресс в stderr
-          const progressMatch = cleanOutput.match(/\[download\]\s+([\d.]+)%/);
-          if (progressMatch) {
-            const percent = parseFloat(progressMatch[1]);
-            const sizeMatch = cleanOutput.match(/of\s+~?\s*([\d.]+\s*(?:B|KiB|MiB|GiB|TiB))/i);
-            const msg = {
-              type: 'ytdlp-download-progress',
-              url: url,
-              percent: percent,
-              output: cleanOutput
-            };
-            if (sizeMatch) msg.filesize = sizeMatch[1].trim().replace(/\s+/g, '');
-            writeMessage(msg);
-          }
-        });
+        child.stdout.on('data', (data) => handleOutput('stdout', data));
+        child.stderr.on('data', (data) => handleOutput('stderr', data));
 
         child.on('close', async (code) => {
           await log(`YT-DLP download finished with code: ${code}`);
@@ -367,8 +334,8 @@ async function handleMessage(msg) {
               type: 'ytdlp-download-complete',
               url: url,
               success: false,
-              error: lastErrorLine
-                ? `${lastErrorLine} (код: ${code})`
+              error: parser.lastError
+                ? `${parser.lastError} (код: ${code})`
                 : `Ошибка загрузки (код: ${code})`
             });
           }
@@ -448,6 +415,92 @@ async function handleMessage(msg) {
     await log(`Handle message error: ${err.message || String(err)}`);
     return { ok: false, error: String(err.message || err) };
   }
+}
+
+// Разбор вывода yt-dlp при загрузке: общий прогресс и последняя ошибка.
+//
+// Формат вида "6+bestaudio/6" yt-dlp качает дорожками по очереди (видео, потом
+// аудио), и у каждой свой прогресс 0–100%. Если брать последнюю строку как есть,
+// то при упавшем видео и уже скачанном аудио ("has already been downloaded",
+// "100% of 35.67MiB") загрузка выглядит завершённой на 100%. Поэтому считаем
+// общий прогресс по всем дорожкам, взвешивая по размеру
+function createDownloadOutputParser(formatId) {
+  const streamCount = Math.max(1, String(formatId || '').split('/')[0].split('+').length);
+  const streams = new Map(); // файл дорожки -> { percent, bytes, size }
+  let currentStream = '';
+  let errorPending = false;
+  const parser = { lastError: null, feed };
+
+  function feed(text) {
+    let changed = false;
+    for (const rawLine of text.split('\n')) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      // yt-dlp печатает "ERROR: " и сам текст ошибки на следующей строке
+      // ("[download] Got error: HTTP Error 503 ... Giving up after 10 retries")
+      if (errorPending) {
+        parser.lastError = `ERROR: ${line}`;
+        errorPending = false;
+      }
+      const errMatch = line.match(/ERROR:\s*(.*)$/);
+      if (errMatch) {
+        if (errMatch[1].trim()) parser.lastError = `ERROR: ${errMatch[1].trim()}`;
+        else errorPending = true;
+        continue;
+      }
+
+      // Начало очередной дорожки
+      const streamMatch = line.match(/^\[download\] Destination:\s*(.+)$/)
+        || line.match(/^\[download\]\s+(.+?) has already been downloaded/);
+      if (streamMatch) {
+        currentStream = streamMatch[1].trim();
+        if (!streams.has(currentStream)) streams.set(currentStream, { percent: 0, bytes: null, size: null });
+        continue;
+      }
+
+      // [download]  45.0% of 1.68GiB at 5.21MiB/s ETA 02:35
+      // [download]   8.3% of ~   1.49GiB at    2.92MiB/s ETA 07:55 (frag 39/457)
+      const progressMatch = line.match(/^\[download\]\s+([\d.]+)%(?:\s+of\s+~?\s*([\d.]+\s*(?:B|KiB|MiB|GiB|TiB)))?/i);
+      if (progressMatch) {
+        const stream = streams.get(currentStream) || { percent: 0, bytes: null, size: null };
+        stream.percent = parseFloat(progressMatch[1]);
+        if (progressMatch[2]) {
+          stream.size = progressMatch[2].replace(/\s+/g, '');
+          stream.bytes = parseSizeToBytes(stream.size);
+        }
+        streams.set(currentStream, stream);
+        changed = true;
+      }
+    }
+    return changed ? overall() : null;
+  }
+
+  function overall() {
+    const list = Array.from(streams.values());
+    if (streamCount === 1) {
+      const s = streams.get(currentStream) || list[list.length - 1];
+      return { percent: s.percent, filesize: s.size };
+    }
+    // Все дорожки известны с размерами — взвешиваем по байтам,
+    // иначе (следующая дорожка ещё не началась) — поровну, неначатые = 0%
+    if (list.length >= streamCount && list.every(s => s.bytes)) {
+      const total = list.reduce((sum, s) => sum + s.bytes, 0);
+      const done = list.reduce((sum, s) => sum + s.bytes * s.percent / 100, 0);
+      return { percent: Math.round(done / total * 1000) / 10, filesize: formatBytes(total) };
+    }
+    const sum = list.reduce((acc, s) => acc + s.percent, 0);
+    return { percent: Math.round(sum / streamCount * 10) / 10, filesize: null };
+  }
+
+  return parser;
+}
+
+function parseSizeToBytes(size) {
+  const m = String(size).match(/^([\d.]+)\s*(B|KiB|MiB|GiB|TiB)$/i);
+  if (!m) return null;
+  const units = { b: 0, kib: 1, mib: 2, gib: 3, tib: 4 };
+  return parseFloat(m[1]) * Math.pow(1024, units[m[2].toLowerCase()]);
 }
 
 // Форматируем байты в стиле yt-dlp (1.27GiB, 490.71MiB)
